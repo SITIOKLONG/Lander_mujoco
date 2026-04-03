@@ -1,6 +1,48 @@
 # 四旋翼NMPC控制器 20250304 Wakkk
 # ACADOS NMPC
-from acados_template import AcadosOcp, AcadosOcpSolver
+import os
+import sys
+from pathlib import Path
+
+
+def _inject_acados_template_path():
+    """Try to locate local acados_template package and prepend it to sys.path."""
+    candidates = []
+
+    direct = os.getenv("ACADOS_TEMPLATE_PATH")
+    if direct:
+        candidates.append(Path(direct).expanduser())
+
+    for key in ("ACADOS_SOURCE_DIR", "ACADOS_ROOT"):
+        root = os.getenv(key)
+        if root:
+            candidates.append(Path(root).expanduser() / "interfaces" / "acados_template")
+
+    # Common local defaults.
+    candidates.append(Path.home() / "acados" / "interfaces" / "acados_template")
+    candidates.append(Path("/Users/jacksit/acados/interfaces/acados_template"))
+
+    for candidate in candidates:
+        pkg_init = candidate / "acados_template" / "__init__.py"
+        if pkg_init.exists():
+            candidate_str = str(candidate)
+            if candidate_str not in sys.path:
+                sys.path.insert(0, candidate_str)
+            return candidate_str
+    return None
+
+
+try:
+    from acados_template import AcadosOcp, AcadosOcpSolver
+except ModuleNotFoundError as exc:
+    injected = _inject_acados_template_path()
+    if injected is None:
+        raise ModuleNotFoundError(
+            "Could not import acados_template. Set ACADOS_SOURCE_DIR/ACADOS_ROOT, "
+            "or ACADOS_TEMPLATE_PATH to <acados>/interfaces/acados_template."
+        ) from exc
+    from acados_template import AcadosOcp, AcadosOcpSolver
+
 from export_model import *
 import numpy as np
 import scipy.linalg

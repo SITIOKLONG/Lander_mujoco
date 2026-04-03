@@ -13,9 +13,9 @@
             "qpoases": ""
         },
         "acados_version": "ec27dd94d",
-        "code_export_directory": "/Users/jacksit/Downloads/Quadrotor-NMPC-Control-main/c_generated_code",
+        "code_export_directory": "/Users/jacksit/git/Lander_mujoco/c_generated_code",
         "cython_include_dirs": [
-            "/Users/jacksit/Downloads/Quadrotor-NMPC-Control-main/.venv/lib/python3.12/site-packages/numpy/_core/include",
+            "/Users/jacksit/git/Lander_mujoco/.venv/lib/python3.12/site-packages/numpy/_core/include",
             "/Users/jacksit/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/include/python3.12"
         ],
         "json_file": "acados_ocp.json",
@@ -2084,7 +2084,7 @@
         "crazyflie_model/crazyflie_expl_vde_adj.c"
     ],
     "external_function_files_ocp": [],
-    "hash": "1ecb42b8cf61c0a22c0d096b7e21cf74",
+    "hash": "671981e231c5d40d875130337a6d44c7",
     "model": {
         "con_h_expr": [],
         "con_h_expr_0": [],

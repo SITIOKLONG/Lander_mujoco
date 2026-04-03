@@ -1,7 +1,14 @@
 # 20250220 Wakkk
 # Quadrotor SE3 Control Demo
 import math
+import multiprocessing as mp
+import os
 from pathlib import Path
+import queue
+import shutil
+import sys
+import time
+import cv2
 import mujoco 
 import mujoco.viewer as viewer 
 import numpy as np
@@ -12,6 +19,133 @@ from nmpc_controller import NMPC_Controller
 controller = NMPC_Controller()
 
 DEG2RAD = math.pi / 180.0
+APRILTAG_ID = 0
+APRILTAG_SIZE_M = 0.4
+BOTTOM_CAM_WINDOW = "Bottom Camera"
+BOTTOM_CAM_WIDTH = 320
+BOTTOM_CAM_HEIGHT = 240
+APRILTAG_TEXTURE_PATH = Path(__file__).resolve().parent / "crazyfile" / "assets" / "apriltag36h11_id0.png"
+
+
+def _bottom_camera_display_worker(frame_queue, window_name):
+    try:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    except cv2.error as exc:
+        print(f"[BottomCam] failed to create OpenCV window: {exc}")
+        return
+
+    last_frame = None
+    try:
+        while True:
+            try:
+                item = frame_queue.get(timeout=0.03)
+                if item is None:
+                    break
+                last_frame = item
+            except queue.Empty:
+                pass
+
+            if last_frame is not None:
+                cv2.imshow(window_name, last_frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord("q"), ord("Q")):
+                break
+    finally:
+        try:
+            cv2.destroyWindow(window_name)
+        except Exception:
+            pass
+        cv2.destroyAllWindows()
+
+
+class BottomCameraDisplayProcess:
+    """Separate process for OpenCV HighGUI to avoid callback-thread GUI calls."""
+
+    def __init__(self, window_name=BOTTOM_CAM_WINDOW):
+        self.window_name = window_name
+        self.ctx = mp.get_context("spawn")
+        self.frame_queue = None
+        self.process = None
+
+    def start(self):
+        if self.process is not None and self.process.is_alive():
+            return
+        self.frame_queue = self.ctx.Queue(maxsize=2)
+        self.process = self.ctx.Process(
+            target=_bottom_camera_display_worker,
+            args=(self.frame_queue, self.window_name),
+            daemon=True,
+        )
+        self.process.start()
+
+    def submit(self, frame_bgr):
+        if self.frame_queue is None or self.process is None or not self.process.is_alive():
+            return
+        try:
+            self.frame_queue.put_nowait(frame_bgr)
+        except queue.Full:
+            try:
+                _ = self.frame_queue.get_nowait()
+            except Exception:
+                pass
+            try:
+                self.frame_queue.put_nowait(frame_bgr)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def close(self):
+        if self.frame_queue is not None:
+            try:
+                self.frame_queue.put_nowait(None)
+            except Exception:
+                pass
+
+        if self.process is not None:
+            self.process.join(timeout=1.0)
+            if self.process.is_alive():
+                self.process.terminate()
+            self.process = None
+
+        if self.frame_queue is not None:
+            try:
+                self.frame_queue.close()
+            except Exception:
+                pass
+            self.frame_queue = None
+
+
+def _require_aruco():
+    if not hasattr(cv2, "aruco"):
+        raise RuntimeError("cv2.aruco is required. Please install opencv-contrib-python.")
+    if not hasattr(cv2.aruco, "DICT_APRILTAG_36h11"):
+        raise RuntimeError("OpenCV build does not expose DICT_APRILTAG_36h11.")
+    return cv2.aruco
+
+
+def ensure_apriltag_texture(texture_path=APRILTAG_TEXTURE_PATH, tag_id=APRILTAG_ID, pixels=512):
+    """Generate a real tag36h11 texture file used by the MuJoCo scene."""
+    aruco = _require_aruco()
+    dictionary = aruco.getPredefinedDictionary(aruco.DICT_APRILTAG_36h11)
+
+    marker_pixels = int(pixels * 0.75)
+    if hasattr(aruco, "generateImageMarker"):
+        marker = aruco.generateImageMarker(dictionary, int(tag_id), int(marker_pixels))
+    else:
+        marker = np.zeros((int(marker_pixels), int(marker_pixels)), dtype=np.uint8)
+        aruco.drawMarker(dictionary, int(tag_id), int(marker_pixels), marker, 1)
+
+    # Add a white margin so OpenCV can find the marker boundary robustly.
+    tag_img = np.full((int(pixels), int(pixels)), 255, dtype=np.uint8)
+    margin = max((int(pixels) - int(marker_pixels)) // 2, 1)
+    tag_img[margin:margin + int(marker_pixels), margin:margin + int(marker_pixels)] = marker
+
+    texture_path.parent.mkdir(parents=True, exist_ok=True)
+    ok = cv2.imwrite(str(texture_path), tag_img)
+    if not ok:
+        raise RuntimeError(f"Failed to write AprilTag texture: {texture_path}")
 
 
 def euler_xyz_to_quat_wxyz(roll, pitch, yaw):
@@ -254,7 +388,7 @@ class WindDisturbance:
     def __init__(
         self,
         body_name="cf2",
-        base_wind=(1.6, 0.3, 0.05),
+        base_wind=(0.3, 0.3, 0.05),
         gust_amp=(0.5, 0.35, 0.1),
         gust_freq_hz=(0.03, 0.05, 0.04),
         drag_coeff=0.015,
@@ -365,6 +499,7 @@ class HeightPolicyJIT:
 
         self.model = None
         self.prev_slider_pos = None
+        self.prev_tag_quat = None
         self.device = torch.device("cpu")
         self.expected_input_dim = None
         self._warned_obs_pad = False
@@ -373,15 +508,18 @@ class HeightPolicyJIT:
     def load(self):
         if not self.model_path.exists():
             raise FileNotFoundError(f"Policy file not found: {self.model_path}")
-        # choose device: prefer CUDA, then MPS (Apple), then CPU
+        # Default to MPS on Apple Silicon unless user explicitly disables it.
+        allow_mps = os.getenv("POLICY_USE_MPS", "1") == "1"
         if torch.cuda.is_available():
             self.device = torch.device("cuda:0")
-        else:
+        elif allow_mps:
             mps_avail = getattr(getattr(torch, "backends", None), "mps", None)
             if mps_avail is not None and getattr(torch.backends.mps, "is_available", lambda: False)():
                 self.device = torch.device("mps")
             else:
                 self.device = torch.device("cpu")
+        else:
+            self.device = torch.device("cpu")
 
         try:
             # load to the selected device if supported by map_location
@@ -407,39 +545,51 @@ class HeightPolicyJIT:
             self.expected_input_dim = None
         if self.expected_input_dim is not None:
             print(f"[HeightPolicyJIT] model expected input dim = {self.expected_input_dim}")
+        print(f"[HeightPolicyJIT] using device = {self.device}")
 
     def reset(self):
         self.prev_slider_pos = None
+        self.prev_tag_quat = None
 
-    def build_obs(self, d, wave_pad, dt):
-        pad_pos, pad_quat = wave_pad.get_pose(d)
-        pad_rot = quat_to_rotmat_wxyz(pad_quat)
-        pad_normal = pad_rot[:, 2]
+    def build_obs_from_tag(self, apriltag_pose, dt):
+        if apriltag_pose is None:
+            tag_pos = np.zeros(3, dtype=np.float64)
+            tag_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        else:
+            tag_pos = np.asarray(apriltag_pose.get("position", np.zeros(3)), dtype=np.float64)
+            tag_quat = np.asarray(apriltag_pose.get("quat_wxyz", np.array([1.0, 0.0, 0.0, 0.0])), dtype=np.float64)
+            q_norm = float(np.linalg.norm(tag_quat))
+            if q_norm < 1e-8:
+                tag_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+            else:
+                tag_quat = tag_quat / q_norm
 
-        drone_pos = d.qpos[0:3].astype(np.float64)
-        rel = drone_pos - pad_pos
-        pad_height = float(np.dot(rel, pad_normal))
-
-        slider_pos = -pad_height
+        # In OpenCV camera frame, +Z points forward from the camera.
+        # Bottom camera points down, so -z_cam is the signed vertical slider-like position.
+        slider_pos = -float(tag_pos[2])
         if self.prev_slider_pos is None or dt <= 0.0:
             slider_vel = 0.0
         else:
             slider_vel = (slider_pos - self.prev_slider_pos) / dt
         self.prev_slider_pos = slider_pos
 
-        pad_ang_vel = wave_pad.current_ang_vel.astype(np.float64)
+        if self.prev_tag_quat is None or dt <= 0.0:
+            tag_ang_vel = np.zeros(3, dtype=np.float64)
+        else:
+            tag_ang_vel = quat_to_ang_vel_wxyz(self.prev_tag_quat, tag_quat, dt)
+        self.prev_tag_quat = tag_quat.copy()
 
         obs = np.array(
             [
                 slider_pos,
                 slider_vel,
-                pad_quat[0],
-                pad_quat[1],
-                pad_quat[2],
-                pad_quat[3],
-                pad_ang_vel[0],
-                pad_ang_vel[1],
-                pad_ang_vel[2],
+                tag_quat[0],
+                tag_quat[1],
+                tag_quat[2],
+                tag_quat[3],
+                tag_ang_vel[0],
+                tag_ang_vel[1],
+                tag_ang_vel[2],
             ],
             dtype=np.float32,
         )
@@ -475,8 +625,21 @@ class HeightPolicyJIT:
             raise RuntimeError("Policy model is not loaded")
 
         with torch.no_grad():
-            x = torch.from_numpy(obs).unsqueeze(0).to(self.device)
-            y = self.model(x)
+            x = torch.from_numpy(obs).unsqueeze(0)
+            try:
+                y = self.model(x.to(self.device))
+            except Exception as exc:
+                if self.device.type != "cpu":
+                    print(f"[HeightPolicyJIT] device inference failed on {self.device}: {exc}")
+                    print("[HeightPolicyJIT] falling back to CPU")
+                    self.device = torch.device("cpu")
+                    try:
+                        self.model.to(self.device)
+                    except Exception:
+                        pass
+                    y = self.model(x.to(self.device))
+                else:
+                    raise
 
         if isinstance(y, (tuple, list)):
             y = y[0]
@@ -493,51 +656,189 @@ class HeightPolicyJIT:
 
 
 class AprilTagPoseTracker:
-    """Compute tag pose in bottom camera frame as detection proxy."""
+    """Render bottom camera and estimate AprilTag pose (tag36h11) with OpenCV."""
 
-    def __init__(self, camera_name="bottom_cam", tag_site_name="apriltag_site"):
+    def __init__(
+        self,
+        camera_name="bottom_cam",
+        tag_id=APRILTAG_ID,
+        tag_size_m=APRILTAG_SIZE_M,
+        render_width=BOTTOM_CAM_WIDTH,
+        render_height=BOTTOM_CAM_HEIGHT,
+        window_name=BOTTOM_CAM_WINDOW,
+    ):
         self.camera_name = camera_name
-        self.tag_site_name = tag_site_name
+        self.tag_id = int(tag_id)
+        self.tag_size_m = float(tag_size_m)
+        self.render_width = int(render_width)
+        self.render_height = int(render_height)
+        self.window_name = window_name
+
         self.cam_id = None
-        self.site_id = None
-        self.last_pose = None
+        self.renderer = None
+        self.aruco = None
+        self.dictionary = None
+        self.detector = None
+
+        self.camera_matrix = None
+        self.dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+
+        half = 0.5 * self.tag_size_m
+        self.tag_object_points = np.array(
+            [
+                [-half, half, 0.0],
+                [half, half, 0.0],
+                [half, -half, 0.0],
+                [-half, -half, 0.0],
+            ],
+            dtype=np.float64,
+        )
+
+        self.last_pose = {
+            "detected": False,
+            "position": np.zeros(3, dtype=np.float64),
+            "quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
+        }
+        self.last_overlay = None
+        self.display_process = None
+        self.local_window_enabled = True
+        self.local_window_created = False
+
+    def set_display_process(self, display_process):
+        self.display_process = display_process
 
     def bind_model(self, m):
+        self.aruco = _require_aruco()
+        self.dictionary = self.aruco.getPredefinedDictionary(self.aruco.DICT_APRILTAG_36h11)
+        if hasattr(self.aruco, "ArucoDetector"):
+            if hasattr(self.aruco, "DetectorParameters"):
+                params = self.aruco.DetectorParameters()
+            else:
+                params = self.aruco.DetectorParameters_create()
+            self.detector = self.aruco.ArucoDetector(self.dictionary, params)
+
         self.cam_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_CAMERA, self.camera_name)
-        self.site_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, self.tag_site_name)
         if self.cam_id < 0:
             raise ValueError(f"Camera '{self.camera_name}' was not found in MuJoCo model")
-        if self.site_id < 0:
-            raise ValueError(f"Site '{self.tag_site_name}' was not found in MuJoCo model")
 
-    def detect_pose(self, d):
-        if self.cam_id is None or self.site_id is None:
-            return None
+        fovy_deg = float(m.cam_fovy[self.cam_id])
+        h = float(self.render_height)
+        w = float(self.render_width)
+        fy = 0.5 * h / math.tan(0.5 * math.radians(fovy_deg))
+        fx = fy
+        cx = 0.5 * (w - 1.0)
+        cy = 0.5 * (h - 1.0)
+        self.camera_matrix = np.array(
+            [
+                [fx, 0.0, cx],
+                [0.0, fy, cy],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
 
-        cam_pos = d.cam_xpos[self.cam_id].copy()
-        cam_rot = d.cam_xmat[self.cam_id].reshape(3, 3).copy()
+        self.renderer = mujoco.Renderer(m, height=self.render_height, width=self.render_width)
 
-        tag_pos = d.site_xpos[self.site_id].copy()
-        tag_rot = d.site_xmat[self.site_id].reshape(3, 3).copy()
+    def _detect_markers(self, gray):
+        if self.detector is not None:
+            return self.detector.detectMarkers(gray)
+        return self.aruco.detectMarkers(gray, self.dictionary)
 
-        rot_c_w = cam_rot.T
-        tag_pos_c = rot_c_w @ (tag_pos - cam_pos)
-        tag_rot_c = rot_c_w @ tag_rot
-        tag_quat_c = rotmat_to_quat_wxyz(tag_rot_c)
+    def detect_pose(self, m, d):
+        if self.cam_id is None or self.renderer is None:
+            return self.last_pose
 
-        detected = bool(tag_pos_c[2] < 0.0)
+        self.renderer.update_scene(d, camera=self.camera_name)
+        frame_rgb = self.renderer.render()
+        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+
+        corners, ids, _ = self._detect_markers(gray)
+
+        detected = False
+        pos_cam = self.last_pose["position"].copy()
+        quat_cam = self.last_pose["quat_wxyz"].copy()
+        overlay = frame_bgr.copy()
+
+        if ids is not None and len(ids) > 0:
+            self.aruco.drawDetectedMarkers(overlay, corners, ids)
+            ids_flat = ids.reshape(-1)
+            match = np.where(ids_flat == self.tag_id)[0]
+            if match.size > 0:
+                idx = int(match[0])
+                image_points = corners[idx].reshape(4, 2).astype(np.float64)
+                solve_flag = getattr(cv2, "SOLVEPNP_IPPE_SQUARE", cv2.SOLVEPNP_ITERATIVE)
+                ok, rvec, tvec = cv2.solvePnP(
+                    self.tag_object_points,
+                    image_points,
+                    self.camera_matrix,
+                    self.dist_coeffs,
+                    flags=solve_flag,
+                )
+                if ok:
+                    detected = True
+                    pos_cam = tvec.reshape(3).astype(np.float64)
+                    rot_cam_tag, _ = cv2.Rodrigues(rvec)
+                    quat_cam = rotmat_to_quat_wxyz(rot_cam_tag).astype(np.float64)
+                    cv2.drawFrameAxes(
+                        overlay,
+                        self.camera_matrix,
+                        self.dist_coeffs,
+                        rvec,
+                        tvec,
+                        0.04,
+                        2,
+                    )
+
+        if detected:
+            status = f"tag36h11 id={self.tag_id}, z={pos_cam[2]:.3f}m"
+        else:
+            status = f"tag36h11 id={self.tag_id} not detected"
+        cv2.putText(overlay, status, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+        self.last_overlay = overlay
+        if self.display_process is not None:
+            self.display_process.submit(overlay)
+
         self.last_pose = {
-            "detected": detected,
-            "position": tag_pos_c,
-            "quat_wxyz": tag_quat_c,
+            "detected": bool(detected),
+            "position": pos_cam,
+            "quat_wxyz": quat_cam,
         }
         return self.last_pose
+
+    def show_last_frame(self):
+        if self.last_overlay is None or not self.local_window_enabled:
+            return
+        try:
+            if not self.local_window_created:
+                cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+                self.local_window_created = True
+            cv2.imshow(self.window_name, self.last_overlay)
+            cv2.waitKey(1)
+        except cv2.error as exc:
+            print(f"[AprilTagPoseTracker] disabling local OpenCV window: {exc}")
+            self.local_window_enabled = False
+
+    def close(self):
+        if self.renderer is not None:
+            try:
+                self.renderer.close()
+            except Exception:
+                pass
+            self.renderer = None
+        if self.local_window_created:
+            try:
+                cv2.destroyWindow(self.window_name)
+            except Exception:
+                pass
+            self.local_window_created = False
 
 
 wave_pad_motion = WavePadMotion()
 wind_disturbance = WindDisturbance()
-height_policy = HeightPolicyJIT(model_path=Path(__file__).resolve().parent / "models" / "model_9999.pt")
+height_policy = HeightPolicyJIT(model_path=Path(__file__).resolve().parent / "models" / "model_2.pt")
 apriltag_tracker = AprilTagPoseTracker()
+bottom_cam_display = BottomCameraDisplayProcess(window_name=BOTTOM_CAM_WINDOW)
 
 gravity = 9.8066        # 重力加速度 单位m/s^2
 mass = 0.033            # 飞行器质量 单位kg
@@ -571,18 +872,51 @@ def calc_motor_input(krpm):
     return _input
 
 # 加载模型回调函数
-def load_callback(m=None, d=None):
-    mujoco.set_mjcb_control(None)
+def setup_simulation(use_external_display=False):
+    ensure_apriltag_texture()
     m = mujoco.MjModel.from_xml_path('./crazyfile/scene.xml')
     d = mujoco.MjData(m)
-    if m is not None:
-        wave_pad_motion.bind_model(m, d)
-        wind_disturbance.bind_model(m, d)
-        height_policy.load()
-        height_policy.reset()
-        apriltag_tracker.bind_model(m)
-        mujoco.set_mjcb_control(lambda m, d: control_callback(m, d))  # 设置控制回调函数
+    wave_pad_motion.bind_model(m, d)
+    wind_disturbance.bind_model(m, d)
+    height_policy.load()
+    height_policy.reset()
+    apriltag_tracker.set_display_process(bottom_cam_display if use_external_display else None)
+    apriltag_tracker.local_window_enabled = not use_external_display
+    apriltag_tracker.local_window_created = False
+    apriltag_tracker.bind_model(m)
     return m, d
+
+
+def load_callback_for_viewer_launch(m=None, d=None):
+    # Compatibility path for platforms/environments where launch_passive is unavailable.
+    mujoco.set_mjcb_control(None)
+    m, d = setup_simulation(use_external_display=True)
+    mujoco.set_mjcb_control(lambda mm, dd: step_control(mm, dd))
+    return m, d
+
+
+def run_headless_bottom_camera_loop():
+    print("[main] viewer unavailable; running simulation loop with bottom camera window")
+    print("[main] press q or ESC in the bottom camera window to quit")
+
+    m, d = setup_simulation(use_external_display=False)
+    try:
+        while True:
+            step_start = time.time()
+
+            step_control(m, d)
+            mujoco.mj_step(m, d)
+            apriltag_tracker.show_last_frame()
+
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord("q"), ord("Q")):
+                break
+
+            remaining = float(m.opt.timestep) - (time.time() - step_start)
+            if remaining > 0.0:
+                time.sleep(remaining)
+    except KeyboardInterrupt:
+        print("[main] headless loop interrupted by user")
 
 # 根据四元数计算旋转矩阵
 def rotation_matrix(q0, q1, q2, q3):
@@ -592,16 +926,16 @@ def rotation_matrix(q0, q1, q2, q3):
     return np.vstack((_row0, _row1, _row2))
 
 log_count = 0
-def control_callback(m, d):
+def step_control(m, d):
     global log_count, gravity, mass, controller, wave_pad_motion, wind_disturbance, height_policy, apriltag_tracker
     wave_pad_motion.step(d)
     wind_disturbance.step_and_apply(d)
 
-    obs = height_policy.build_obs(d, wave_pad_motion, float(m.opt.timestep))
+    apriltag_pose = apriltag_tracker.detect_pose(m, d)
+    obs = height_policy.build_obs_from_tag(apriltag_pose, float(m.opt.timestep))
     desired_height, raw_action = height_policy.infer_height(obs)
 
     pad_pos, _ = wave_pad_motion.get_pose(d)
-    apriltag_pose = apriltag_tracker.detect_pose(d)
 
     _pos = d.qpos
     _vel = d.qvel
@@ -640,5 +974,115 @@ def control_callback(m, d):
                 f"wind={wind_disturbance.current_wind}, wind_force={wind_disturbance.current_force}"
             )
 
+
+def _find_mjpython_executable():
+    local = Path(sys.executable).with_name("mjpython")
+    if local.exists() and os.access(local, os.X_OK):
+        return str(local)
+    return shutil.which("mjpython")
+
+
+def _ensure_dyld_python_lib_path_for_mjpython():
+    if sys.platform != "darwin":
+        return
+
+    ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+    candidates = [
+        Path(sys.base_prefix) / "lib",
+        Path(sys.prefix) / "lib",
+    ]
+
+    lib_dirs = []
+    for lib_dir in candidates:
+        if (lib_dir / f"libpython{ver}.dylib").exists():
+            lib_dirs.append(str(lib_dir))
+
+    if not lib_dirs:
+        return
+
+    old = os.getenv("DYLD_FALLBACK_LIBRARY_PATH", "")
+    merged = list(lib_dirs)
+    if old:
+        merged.extend([p for p in old.split(":") if p])
+
+    dedup = []
+    seen = set()
+    for p in merged:
+        if p not in seen:
+            seen.add(p)
+            dedup.append(p)
+
+    os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = ":".join(dedup)
+
+
+def _reexec_under_mjpython_if_needed():
+    if sys.platform != "darwin":
+        return
+    if os.getenv("MUJOCO_REEXEC_DONE") == "1":
+        return
+
+    # Default to normal python on macOS: OpenCV HighGUI windows are often unstable under mjpython.
+    if os.getenv("MUJOCO_USE_MJPYTHON", "0") != "1":
+        return
+
+    mjpython = _find_mjpython_executable()
+    if mjpython is None:
+        print("[main] WARNING: launch_passive on macOS requires mjpython, but none was found in this environment.")
+        print("[main] Please run: uv run mjpython main.py")
+        return
+
+    _ensure_dyld_python_lib_path_for_mjpython()
+    os.environ["MUJOCO_REEXEC_DONE"] = "1"
+    script_path = str(Path(__file__).resolve())
+    print(f"[main] Relaunching with mjpython: {mjpython}")
+    os.execv(mjpython, [mjpython, script_path, *sys.argv[1:]])
+
 if __name__ == '__main__':
-    viewer.launch(loader=load_callback)
+    m = None
+    d = None
+    try:
+        _reexec_under_mjpython_if_needed()
+
+        # On macOS normal python, launch_passive is unavailable and cv2 windows are unstable under mjpython.
+        # Use viewer.launch directly so MuJoCo + OpenCV windows can coexist.
+        if sys.platform == "darwin" and os.getenv("MUJOCO_USE_MJPYTHON", "0") != "1":
+            print("[main] macOS python runtime: using viewer.launch (OpenCV window compatible)")
+            bottom_cam_display.start()
+            try:
+                viewer.launch(loader=load_callback_for_viewer_launch)
+            except Exception as exc:
+                print(f"[main] viewer.launch failed: {exc}")
+                bottom_cam_display.close()
+                run_headless_bottom_camera_loop()
+            finally:
+                bottom_cam_display.close()
+            sys.exit(0)
+
+        m, d = setup_simulation(use_external_display=False)
+        try:
+            with viewer.launch_passive(m, d) as v:
+                while v.is_running():
+                    step_start = time.time()
+
+                    step_control(m, d)
+                    mujoco.mj_step(m, d)
+                    apriltag_tracker.show_last_frame()
+
+                    v.sync()
+
+                    remaining = float(m.opt.timestep) - (time.time() - step_start)
+                    if remaining > 0.0:
+                        time.sleep(remaining)
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "launch_passive" in msg and "mjpython" in msg:
+                print("[main] launch_passive unavailable in this runtime; falling back to viewer.launch")
+                apriltag_tracker.close()
+                bottom_cam_display.start()
+                viewer.launch(loader=load_callback_for_viewer_launch)
+            else:
+                raise
+    finally:
+        bottom_cam_display.close()
+        apriltag_tracker.close()
+        cv2.destroyAllWindows()
