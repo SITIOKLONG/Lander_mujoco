@@ -80,6 +80,10 @@ class NMPC_Controller:
         # hovor speed: 15.777730167256925 krpm
 
         self.max_speed = 22.0  # 电机最高转速(krpm)
+        self.safe_hover_control = np.full((4,), self.hov_w, dtype=np.float64)
+        self.last_control = self.safe_hover_control.copy()
+        self.last_valid_state = np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        self.fail_count = 0
 
         # set weighting matrices 状态权重矩阵
         Q = np.eye(self.nx)
@@ -178,35 +182,88 @@ class NMPC_Controller:
         self.acados_solver = AcadosOcpSolver(self.ocp, json_file = 'acados_ocp.json')
         print("NMPC Controller Init Done")
 
+    def _sanitize_state(self, state, fallback_state):
+        x = np.asarray(state, dtype=np.float64).reshape(-1)
+        if x.size != self.nx:
+            raise ValueError(f"Expected state dim {self.nx}, got {x.size}")
+
+        fallback = np.asarray(fallback_state, dtype=np.float64).reshape(-1)
+        if fallback.size != self.nx:
+            fallback = self.last_valid_state
+
+        out = x.copy()
+        invalid = ~np.isfinite(out)
+        if np.any(invalid):
+            out[invalid] = fallback[invalid]
+
+        q = out[3:7]
+        q_norm = float(np.linalg.norm(q))
+        if (not np.isfinite(q_norm)) or q_norm < 1e-8:
+            out[3:7] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        else:
+            out[3:7] = q / q_norm
+        return out
+
+    def _recover_solver_warmstart(self, safe_state):
+        """Reset solver trajectory with safe values after an infeasible/NaN step."""
+        try:
+            for i in range(self.N):
+                self.acados_solver.set(i, "x", safe_state)
+                self.acados_solver.set(i, "u", self.safe_hover_control)
+            self.acados_solver.set(self.N, "x", safe_state)
+        except Exception:
+            pass
+
     # 状态空间位点控制
     # current_state当前状态: [x, y, z, qw, qx, qy, qz, vbx, vby, vbz, wx, wy, wz] 
     # goal_state目标状态:    [x, y, z, qw, qx, qy, qz, vbx, vby, vbz, wx, wy, wz] 
     def nmpc_state_control(self, current_state, goal_state):
         _start = time.perf_counter()
-        # Set initial condition, equality constraint
-        self.acados_solver.set(0, 'lbx', current_state)
-        self.acados_solver.set(0, 'ubx', current_state)
+        safe_current = self._sanitize_state(current_state, self.last_valid_state)
+        safe_goal = self._sanitize_state(goal_state, safe_current)
+        self.last_valid_state = safe_current.copy()
 
-        y_ref = np.concatenate((goal_state, np.array([self.hov_w, self.hov_w, self.hov_w, self.hov_w])))
+        # Set initial condition, equality constraint
+        self.acados_solver.set(0, 'lbx', safe_current)
+        self.acados_solver.set(0, 'ubx', safe_current)
+
+        y_ref = np.concatenate((safe_goal, np.array([self.hov_w, self.hov_w, self.hov_w, self.hov_w])))
         # Set Goal State
         for i in range(self.N):
             self.acados_solver.set(i, 'yref', y_ref)   # 过程参考
-        y_refN = goal_state 
+        y_refN = safe_goal 
         self.acados_solver.set(self.N, 'yref', y_refN)   # 终端参考
 
         # Solve Problem
-        self.acados_solver.solve()
-        # Get Solution
-        w_opt_acados = np.ndarray((self.N, 4))  # 控制输入
-        x_opt_acados = np.ndarray((self.N + 1, len(current_state)))   # 状态估计
-        x_opt_acados[0, :] = self.acados_solver.get(0, "x")
-        for i in range(self.N):
-            w_opt_acados[i, :] = self.acados_solver.get(i, "u")
-            x_opt_acados[i + 1, :] = self.acados_solver.get(i + 1, "x")
-        # return w_opt_acados, x_opt_acados  # 返回控制输入和状态
+        status = int(self.acados_solver.solve())
+
+        # Use only first control action and guard against NaN/infeasible solver outputs.
+        try:
+            u0 = np.asarray(self.acados_solver.get(0, "u"), dtype=np.float64).reshape(-1)
+        except Exception:
+            u0 = np.full((self.nu,), np.nan, dtype=np.float64)
+
+        valid_u0 = (status == 0) and (u0.size == self.nu) and bool(np.all(np.isfinite(u0)))
+        if valid_u0:
+            u0 = np.clip(u0, 0.0, self.max_speed)
+            self.last_control = u0.copy()
+            self.fail_count = 0
+        else:
+            self.fail_count += 1
+            if self.fail_count <= 5 or self.fail_count % 20 == 0:
+                print(
+                    f"[NMPC] WARNING: invalid solver output (status={status}). "
+                    f"Using fallback hover control. fail_count={self.fail_count}"
+                )
+            u0 = self.last_control.copy()
+            if not np.all(np.isfinite(u0)):
+                u0 = self.safe_hover_control.copy()
+                self.last_control = u0.copy()
+            self._recover_solver_warmstart(safe_current)
+
         _end = time.perf_counter()
         _dt = _end - _start
-        return _dt, w_opt_acados[0]  # 返回最近控制输入 4 Vector
+        return _dt, u0  # 返回最近控制输入 4 Vector
         # control_input = self.acados_solver.get(0, "u")
         # state_estimate = self.acados_solver.get(self.N, "x")
         # return control_input, state_estimate  # 返回所有控制输入和状态

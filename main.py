@@ -381,6 +381,14 @@ class WavePadMotion:
     def get_pose(self, d):
         return d.mocap_pos[self.mocap_id].copy(), d.mocap_quat[self.mocap_id].copy()
 
+    def get_phase_features(self):
+        """Return [cos(phase_i), sin(phase_i)] for each active wave component."""
+        k = max(int(self.n_sines), 1)
+        if self.omegas is None or self.phases is None:
+            return np.zeros((2 * k,), dtype=np.float64)
+        angles = self.omegas * self.t + self.phases
+        return np.concatenate([np.cos(angles), np.sin(angles)]).astype(np.float64)
+
 
 class WindDisturbance:
     """Apply smooth wind disturbance as external force/torque on the drone body."""
@@ -388,15 +396,15 @@ class WindDisturbance:
     def __init__(
         self,
         body_name="cf2",
-        base_wind=(0.3, 0.3, 0.05),
-        gust_amp=(0.5, 0.35, 0.1),
+        base_wind=(0.01, 0.01, 0.01),
+        gust_amp=(0.01, 0.01, 0.01),
         gust_freq_hz=(0.03, 0.05, 0.04),
         drag_coeff=0.015,
         ou_rho=0.998,
         ou_sigma=0.03,
         torque_sigma=1.2e-4,
-        max_force=0.08,
-        max_torque=0.0012,
+        max_force=0.04,
+        max_torque=0.0003,
         seed=17,
     ):
         self.body_name = body_name
@@ -489,6 +497,9 @@ class HeightPolicyJIT:
         output_is_normalized=False,
         action_scale=1.0,
         action_bias=0.0,
+        max_roll_deg=25.0,
+        max_pitch_deg=25.0,
+        max_yaw_deg=45.0,
     ):
         self.model_path = Path(model_path)
         self.min_height = float(min_height)
@@ -496,6 +507,9 @@ class HeightPolicyJIT:
         self.output_is_normalized = bool(output_is_normalized)
         self.action_scale = float(action_scale)
         self.action_bias = float(action_bias)
+        self.max_roll_rad = float(max_roll_deg) * DEG2RAD
+        self.max_pitch_rad = float(max_pitch_deg) * DEG2RAD
+        self.max_yaw_rad = float(max_yaw_deg) * DEG2RAD
 
         self.model = None
         self.prev_slider_pos = None
@@ -504,6 +518,15 @@ class HeightPolicyJIT:
         self.expected_input_dim = None
         self._warned_obs_pad = False
         self._warned_obs_trunc = False
+        self._warned_action_dim = False
+
+        # IsaacLab policy layout (54 dims):
+        # pos_hist(4), vel_hist(4), quat_hist(16), ang_vel_hist(12), wave_phase(12), contact_hist(6)
+        self._slider_pos_hist = np.zeros((4,), dtype=np.float64)
+        self._slider_vel_hist = np.zeros((4,), dtype=np.float64)
+        self._pad_quat_hist = np.tile(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64), (4, 1))
+        self._pad_ang_vel_hist = np.zeros((4, 3), dtype=np.float64)
+        self._contact_hist = np.zeros((2, 3), dtype=np.float64)
 
     def load(self):
         if not self.model_path.exists():
@@ -550,8 +573,30 @@ class HeightPolicyJIT:
     def reset(self):
         self.prev_slider_pos = None
         self.prev_tag_quat = None
+        self._slider_pos_hist[:] = 0.0
+        self._slider_vel_hist[:] = 0.0
+        self._pad_quat_hist[:] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        self._pad_ang_vel_hist[:] = 0.0
+        self._contact_hist[:] = 0.0
 
-    def build_obs_from_tag(self, apriltag_pose, dt):
+    def _push_scalar_hist(self, hist, value):
+        hist[:-1] = hist[1:]
+        hist[-1] = float(value)
+
+    def _push_vector_hist(self, hist, vec):
+        hist[:-1, :] = hist[1:, :]
+        hist[-1, :] = np.asarray(vec, dtype=np.float64)
+
+    def _fit_vec(self, vec, target_dim):
+        vec = np.asarray(vec, dtype=np.float64).reshape(-1)
+        if vec.size == target_dim:
+            return vec
+        out = np.zeros((target_dim,), dtype=np.float64)
+        n = min(target_dim, vec.size)
+        out[:n] = vec[:n]
+        return out
+
+    def build_obs_from_tag(self, apriltag_pose, dt, wave_phase_features=None, contact_force=None):
         if apriltag_pose is None:
             tag_pos = np.zeros(3, dtype=np.float64)
             tag_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
@@ -579,20 +624,32 @@ class HeightPolicyJIT:
             tag_ang_vel = quat_to_ang_vel_wxyz(self.prev_tag_quat, tag_quat, dt)
         self.prev_tag_quat = tag_quat.copy()
 
-        obs = np.array(
-            [
-                slider_pos,
-                slider_vel,
-                tag_quat[0],
-                tag_quat[1],
-                tag_quat[2],
-                tag_quat[3],
-                tag_ang_vel[0],
-                tag_ang_vel[1],
-                tag_ang_vel[2],
-            ],
-            dtype=np.float32,
+        wave_phase = self._fit_vec(
+            np.zeros((12,), dtype=np.float64) if wave_phase_features is None else wave_phase_features,
+            12,
         )
+        contact_force = self._fit_vec(
+            np.zeros((3,), dtype=np.float64) if contact_force is None else contact_force,
+            3,
+        )
+
+        self._push_scalar_hist(self._slider_pos_hist, slider_pos)
+        self._push_scalar_hist(self._slider_vel_hist, slider_vel)
+        self._push_vector_hist(self._pad_quat_hist, tag_quat)
+        self._push_vector_hist(self._pad_ang_vel_hist, tag_ang_vel)
+        self._push_vector_hist(self._contact_hist, contact_force)
+
+        obs = np.concatenate(
+            [
+                self._slider_pos_hist,
+                self._slider_vel_hist,
+                self._pad_quat_hist.reshape(-1),
+                self._pad_ang_vel_hist.reshape(-1),
+                wave_phase,
+                self._contact_hist.reshape(-1),
+            ],
+            axis=0,
+        ).astype(np.float32)
         return self._pad_obs(obs)
 
     def _pad_obs(self, obs: np.ndarray) -> np.ndarray:
@@ -620,9 +677,14 @@ class HeightPolicyJIT:
             self._warned_obs_pad = True
         return padded
 
-    def infer_height(self, obs):
+    def _infer_raw_action(self, obs):
         if self.model is None:
             raise RuntimeError("Policy model is not loaded")
+
+        obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+        if not np.all(np.isfinite(obs)):
+            obs = obs.copy()
+            obs[~np.isfinite(obs)] = 0.0
 
         with torch.no_grad():
             x = torch.from_numpy(obs).unsqueeze(0)
@@ -644,15 +706,54 @@ class HeightPolicyJIT:
         if isinstance(y, (tuple, list)):
             y = y[0]
         y_np = np.asarray(y.detach().cpu().numpy(), dtype=np.float64).reshape(-1)
+        if y_np.size == 0:
+            raise RuntimeError("Policy output is empty")
+        return y_np
+
+    def infer_height_attitude(self, obs):
+        """Return policy-derived (height_cmd_m, attitude_cmd_rpy_rad, raw_action_vec)."""
+        y_np = self._infer_raw_action(obs)
         raw = float(y_np[0])
+        if not np.isfinite(raw):
+            raw = 0.0
 
         if self.output_is_normalized:
             mapped = 0.5 * (raw + 1.0) * (self.max_height - self.min_height) + self.min_height
         else:
             mapped = self.action_scale * raw + self.action_bias
+        if not np.isfinite(mapped):
+            mapped = self.min_height
 
         height_cmd = float(np.clip(mapped, self.min_height, self.max_height))
-        return height_cmd, raw
+
+        # Policy action layout: [height, roll, pitch, yaw].
+        # If attitude channels are missing, keep missing commands at zero.
+        att_raw = np.zeros((3,), dtype=np.float64)
+        n_att = min(max(int(y_np.size) - 1, 0), 3)
+        if n_att > 0:
+            att_raw[:n_att] = np.clip(y_np[1 : 1 + n_att], -1.0, 1.0)
+        if n_att < 3 and not self._warned_action_dim:
+            print(
+                f"[HeightPolicyJIT] WARNING: policy action dim={y_np.size}; "
+                "expected >=4 for [height, roll, pitch, yaw]. Missing attitude channels set to 0."
+            )
+            self._warned_action_dim = True
+
+        attitude_cmd_rpy = np.array(
+            [
+                att_raw[0] * self.max_roll_rad,
+                att_raw[1] * self.max_pitch_rad,
+                att_raw[2] * self.max_yaw_rad,
+            ],
+            dtype=np.float64,
+        )
+        attitude_cmd_rpy[~np.isfinite(attitude_cmd_rpy)] = 0.0
+        return height_cmd, attitude_cmd_rpy, y_np
+
+    def infer_height(self, obs):
+        """Backward-compatible API: return (height_cmd_m, raw_height_action)."""
+        height_cmd, _, raw_action = self.infer_height_attitude(obs)
+        return height_cmd, float(raw_action[0])
 
 
 class AprilTagPoseTracker:
@@ -806,6 +907,30 @@ class AprilTagPoseTracker:
         }
         return self.last_pose
 
+    def estimate_tag_world_position(self, d, pose=None):
+        """Estimate tag center in world frame from camera pose + OpenCV tvec.
+
+        OpenCV camera coordinates are x-right, y-down, z-forward.
+        MuJoCo camera local frame is x-right, y-up, z-backward.
+        """
+        if self.cam_id is None:
+            return None
+
+        if pose is None:
+            pose = self.last_pose
+        if pose is None or not bool(pose.get("detected", False)):
+            return None
+
+        pos_cam_cv = np.asarray(pose.get("position", np.zeros(3)), dtype=np.float64)
+        if pos_cam_cv.size != 3:
+            return None
+
+        # Convert OpenCV camera-frame vector to MuJoCo camera-frame vector.
+        cam_to_tag_mj = np.array([pos_cam_cv[0], -pos_cam_cv[1], -pos_cam_cv[2]], dtype=np.float64)
+        cam_world_pos = np.asarray(d.cam_xpos[self.cam_id], dtype=np.float64).copy()
+        cam_world_rot = np.asarray(d.cam_xmat[self.cam_id], dtype=np.float64).reshape(3, 3)
+        return cam_world_pos + cam_world_rot @ cam_to_tag_mj
+
     def show_last_frame(self):
         if self.last_overlay is None or not self.local_window_enabled:
             return
@@ -859,6 +984,8 @@ def calc_motor_force(krpm):
 
 # 根据电机转速计算电机归一化输入
 def calc_motor_input(krpm):
+    if not np.isfinite(krpm):
+        krpm = float(np.sqrt((mass * gravity) / (4.0 * Ct)))
     if krpm > 22:
         krpm = 22
     elif krpm < 0:
@@ -870,6 +997,48 @@ def calc_motor_input(krpm):
     elif _input < 0:
         _input = 0
     return _input
+
+
+_CONTACT_CACHE = {
+    "drone_body_id": -2,
+    "pad_geom_id": -2,
+}
+
+
+def estimate_contact_force_between_drone_and_pad(m, d):
+    """Approximate contact force (world xyz) between `cf2` body and `wave_pad_geom`."""
+    if _CONTACT_CACHE["drone_body_id"] < 0:
+        _CONTACT_CACHE["drone_body_id"] = int(mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "cf2"))
+    if _CONTACT_CACHE["pad_geom_id"] < 0:
+        _CONTACT_CACHE["pad_geom_id"] = int(mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "wave_pad_geom"))
+
+    drone_body_id = _CONTACT_CACHE["drone_body_id"]
+    pad_geom_id = _CONTACT_CACHE["pad_geom_id"]
+    if drone_body_id < 0 or pad_geom_id < 0:
+        return np.zeros((3,), dtype=np.float64)
+
+    total_world_force = np.zeros((3,), dtype=np.float64)
+    force_contact = np.zeros((6,), dtype=np.float64)
+
+    for i in range(int(d.ncon)):
+        contact = d.contact[i]
+        g1 = int(contact.geom1)
+        g2 = int(contact.geom2)
+        if g1 == pad_geom_id:
+            other_geom = g2
+        elif g2 == pad_geom_id:
+            other_geom = g1
+        else:
+            continue
+
+        if int(m.geom_bodyid[other_geom]) != drone_body_id:
+            continue
+
+        mujoco.mj_contactForce(m, d, i, force_contact)
+        frame = np.asarray(contact.frame, dtype=np.float64).reshape(3, 3)
+        total_world_force += frame @ force_contact[:3]
+
+    return total_world_force
 
 # 加载模型回调函数
 def setup_simulation(use_external_display=False):
@@ -932,10 +1101,23 @@ def step_control(m, d):
     wind_disturbance.step_and_apply(d)
 
     apriltag_pose = apriltag_tracker.detect_pose(m, d)
-    obs = height_policy.build_obs_from_tag(apriltag_pose, float(m.opt.timestep))
-    desired_height, raw_action = height_policy.infer_height(obs)
+    wave_phase_features = wave_pad_motion.get_phase_features()
+    contact_force = estimate_contact_force_between_drone_and_pad(m, d)
+    obs = height_policy.build_obs_from_tag(
+        apriltag_pose,
+        float(m.opt.timestep),
+        wave_phase_features=wave_phase_features,
+        contact_force=contact_force,
+    )
+    desired_height_raw, desired_att_rpy, raw_action_vec = height_policy.infer_height_attitude(obs)
+    desired_height = float(desired_height_raw)
+    if not np.isfinite(desired_height):
+        desired_height = float(height_policy.min_height)
+    desired_height = float(np.clip(desired_height, height_policy.min_height, height_policy.max_height))
 
-    pad_pos, _ = wave_pad_motion.get_pose(d)
+    # Build visual target from AprilTag center in world frame.
+    tag_world_pos = apriltag_tracker.estimate_tag_world_position(d, apriltag_pose)
+    pad_pos_fallback, _ = wave_pad_motion.get_pose(d)
 
     _pos = d.qpos
     _vel = d.qvel
@@ -952,13 +1134,59 @@ def step_control(m, d):
     quat_z = _sensor_data[9]
     quat = np.array([quat_x, quat_y, quat_z, quat_w])  # x y z w
     omega = np.array([gyro_x, gyro_y, gyro_z])         # 角速度
+
+    if tag_world_pos is not None and np.all(np.isfinite(tag_world_pos)):
+        goal_pos = np.array(
+            [
+                tag_world_pos[0],
+                tag_world_pos[1],
+                tag_world_pos[2] + desired_height,
+            ],
+            dtype=np.float64,
+        )
+    else:
+        goal_pos = np.array(
+            [
+                pad_pos_fallback[0],
+                pad_pos_fallback[1],
+                pad_pos_fallback[2] + desired_height,
+            ],
+            dtype=np.float64,
+        )
+
+    # Final safety clamp against any non-finite target values.
+    fallback_goal = np.array([_pos[0], _pos[1], _pos[2] + desired_height], dtype=np.float64)
+    if not np.all(np.isfinite(goal_pos)):
+        goal_pos = fallback_goal
+
+    goal_att_rpy = np.asarray(desired_att_rpy, dtype=np.float64)
+    if goal_att_rpy.size != 3 or not np.all(np.isfinite(goal_att_rpy)):
+        goal_att_rpy = np.zeros((3,), dtype=np.float64)
     # 构建当前状态
     current_state = np.array([_pos[0], _pos[1], _pos[2], quat[3], quat[0], quat[1], quat[2], _vel[0], _vel[1], _vel[2], omega[0], omega[1], omega[2]])
-    # 位置控制模式 目标位点
-    goal_position = np.array([pad_pos[0], pad_pos[1], pad_pos[2] + desired_height])
+    # MPC tracks AprilTag-center hover target with direct policy attitude.
+    goal_quat = euler_xyz_to_quat_wxyz(goal_att_rpy[0], goal_att_rpy[1], goal_att_rpy[2])
+    goal_state = np.array(
+        [
+            goal_pos[0],
+            goal_pos[1],
+            goal_pos[2],
+            goal_quat[0],
+            goal_quat[1],
+            goal_quat[2],
+            goal_quat[3],
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ],
+        dtype=np.float64,
+    )
 
     # NMPC Update
-    _dt, _control = controller.nmpc_position_control(current_state, goal_position)
+    _dt, _control = controller.nmpc_state_control(current_state, goal_state)
     d.actuator('motor1').ctrl[0] = calc_motor_input(_control[0])
     d.actuator('motor2').ctrl[0] = calc_motor_input(_control[1])
     d.actuator('motor3').ctrl[0] = calc_motor_input(_control[2])
@@ -968,8 +1196,11 @@ def step_control(m, d):
     if log_count >= 50:
         log_count = 0
         if apriltag_pose is not None:
+            raw_str = np.array2string(raw_action_vec, precision=3, suppress_small=True)
+            att_deg = np.degrees(goal_att_rpy)
             print(
-                f"policy_raw={raw_action:.4f}, h_cmd={desired_height:.3f}, "
+                f"policy_raw={raw_str}, h_cmd={desired_height:.3f}, "
+                f"att_cmd_deg={att_deg}, goal_pos={goal_pos}, "
                 f"tag_detected={apriltag_pose['detected']}, tag_cam_pos={apriltag_pose['position']}, "
                 f"wind={wind_disturbance.current_wind}, wind_force={wind_disturbance.current_force}"
             )
