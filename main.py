@@ -257,7 +257,7 @@ class WavePadMotion:
         amp_roll_deg=30.0,
         amp_pitch_deg=30.0,
         freq_min=0.05,
-        freq_max=0.25,
+        freq_max=0.1,
         n_sines=6,
         ou_rho=0.99,
         ou_sigma=0.05,
@@ -961,7 +961,7 @@ class AprilTagPoseTracker:
 
 wave_pad_motion = WavePadMotion()
 wind_disturbance = WindDisturbance()
-height_policy = HeightPolicyJIT(model_path=Path(__file__).resolve().parent / "models" / "model_2.pt")
+height_policy = HeightPolicyJIT(model_path=Path(__file__).resolve().parent / "models" / "policy.pt")
 apriltag_tracker = AprilTagPoseTracker()
 bottom_cam_display = BottomCameraDisplayProcess(window_name=BOTTOM_CAM_WINDOW)
 
@@ -1103,6 +1103,19 @@ def step_control(m, d):
     apriltag_pose = apriltag_tracker.detect_pose(m, d)
     wave_phase_features = wave_pad_motion.get_phase_features()
     contact_force = estimate_contact_force_between_drone_and_pad(m, d)
+
+    # If landing gear collided with the pad, reset drone height to 5.0 m
+    if np.linalg.norm(contact_force) > 1e-6:
+        print("[main] landing gear contacted pad — resetting drone height to 5.0 m")
+        # set z position (qpos[2]) to 5 meters and zero velocities
+        d.qpos[2] = 5.0
+        if hasattr(d, 'qvel') and d.qvel.shape[0] >= 6:
+            d.qvel[:6] = 0.0
+        elif hasattr(d, 'qvel'):
+            d.qvel[:] = 0.0
+        # update forward kinematics / derived quantities
+        mujoco.mj_forward(m, d)
+
     obs = height_policy.build_obs_from_tag(
         apriltag_pose,
         float(m.opt.timestep),
