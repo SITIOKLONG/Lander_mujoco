@@ -1,3 +1,4 @@
+from src.math_utils import quaternion_to_R, rot_to_rpy_zxy
 import numpy as np
 import cvxpy as cp
 import cv2
@@ -11,9 +12,68 @@ import os
 os.environ["MUJOCO_GL"] = "egl"
 
 
-def solve_mpc(current_error, target_height):
-    N = 20
+# params
+dt_sim = 1/120
+control_decimation = 2
+dt_control = control_decimation * dt_sim
+control_step = 0
 
+# drone params
+g0 = 9.8066
+mq = 33e-3
+Ixx = 1.395e-5
+Iyy = 1.395e-5
+Izz = 2.173e-5
+Cd = 7.9379e-06
+Ct = 3.25e-4
+dq = 65e-3
+l = dq/2
+
+A = np.eye(6)
+A[0, 3] = A[1, 4] = A[2, 5] = dt_control
+
+B = np.zeros((6, 3))    # u = [angle_x, angle_y, acceleration_z]
+B[3, 0] = g0 * dt_control
+B[4, 1] = g0 * dt_control
+B[5, 2] = dt_control
+B[0, 0] = 0.5 * g0 * dt_control**2
+B[1, 1] = 0.5 * g0 * dt_control**2
+B[2, 2] = 0.5 * dt_control**2
+
+# state: [px, py, pz, vx, vy, vz]
+Q = np.diag([10, 10, 200, 20.0, 20.0, 50.0])
+# control: [roll_cmd, pitch_cmd, accel_z_cmd]
+R = np.diag([0.5, 0.5, 0.05])
+
+# mixer gain
+Kp_roll = 0.005
+Kd_roll = 0.00011
+Kp_pitch = 0.005
+Kd_pitch = 0.00011
+Kp_yaw = 0.005
+Kd_yaw = 0.00011
+
+
+def build_B(psi, dt, g):
+    c = np.cos(psi)
+    s = np.sin(psi)
+    B = np.zeros((6, 3))
+
+    B[0, 0] = 0.5 * g * dt**2 * c
+    B[0, 1] = 0.5 * g * dt**2 * s
+    B[1, 0] = 0.5 * g * dt**2 * s
+    B[1, 1] = -0.5 * g * dt**2 * c
+    B[2, 2] = 0.5 * dt**2
+
+    B[3, 0] = g * dt * c
+    B[3, 1] = g * dt * s
+    B[4, 0] = g * dt * s
+    B[4, 1] = -g * dt * c
+    B[5, 2] = dt
+    return B
+
+
+def solve_mpc(state, target_height, Q, R, A, B, dt, N=50):
     u = cp.Variable((3, N))     # control: pitch, roll, thrust
     x = cp.Variable((6, N + 1))     # state: [pos, vel]
 
@@ -29,46 +89,23 @@ def solve_mpc(current_error, target_height):
         # dynamics
         constraints += [x[:, t+1] == A @ x[:, t] + B @ u[:, t]]
 
+        # print("A: ", A, "B: ", B)
+
         # physical
-        constraints += [u[0, t] <= 0.5, u[0, t] >= - 0.5]  # roll angle
-        constraints += [u[1, t] <= 0.5, u[1, t] >= - 0.5]  # pitch angle
+        constraints += [u[0, t] <= 0.3, u[0, t] >= - 0.3]  # roll angle
+        constraints += [u[1, t] <= 0.3, u[1, t] >= - 0.3]  # pitch angle
+        constraints += [u[2, t] <= 5.0, u[2, t] >= - 2.0]  # accele_z
 
     prob = cp.Problem(cp.Minimize(cost), constraints)
-    prob.solve()
+    prob.solve(solver=cp.OSQP, verbose=False)
+    # if prob.status not in ["optimal", "optimal_inaccurate"]:
+    #     print("MPC not optimal", prob.status)
+    #     return np.zeros(3)  # last
+
+    # print("prob: ", prob.status)
 
     return u[:, 0].value
 
-
-# params
-dt = 1/120
-control_decimation = 2
-
-# drone params
-g0 = 9.8066
-mq = 33e-3
-Ixx = 1.395e-5
-Iyy = 1.395e-5
-Izz = 2.173e-5
-Cd = 7.9379e-06
-Ct = 3.25e-4
-dq = 65e-3
-l = dq/2
-
-A = np.eye(6)   # A simple COM model
-A[0, 3] = A[1, 4] = A[2, 5] = dt
-
-B = np.zeros((6, 3))    # u = [angle_x, angle_y, acceleration_z]
-B[3, 0] = g0 * dt
-B[4, 1] = g0 * dt
-B[5, 2] = dt
-B[0, 0] = 0.5 * g0 * dt**2
-B[1, 1] = 0.5 * g0 * dt**2
-B[2, 2] = 0.5 * dt**2
-
-# state: [px, py, pz, vx, vy, vz]
-Q = np.diag([100.0, 100.0, 15.0, 1.0, 1.0, 1.0])
-# control: [roll_cmd, pitch_cmd, accel_z_cmd]
-R = np.diag([0.1, 0.1, 0.05])
 
 # openGL drone track camera
 resolution = (1920, 1080)
@@ -115,73 +152,129 @@ CAMERA_MATRIX = np.array([
 ], dtype=np.float32)
 DIST_COEFFS = np.zeros((5, 1), dtype=np.float32)
 
-last_tvec = None
-vel = np.zeros(3)
+# setup params
+last_pos_rel = None
+vel_rel = np.zeros(3)
+last_u_cmd = np.array([0.0, 0.0, 0.0])
 with mujoco.viewer.launch_passive(model, data) as viewer:
     while viewer.is_running():
         mujoco.mj_step(model, data)
+        control_step += 1
+        # print("control_step: ", control_step)
         viewer.sync()
 
-        # track camera cv2
-        viewport = mujoco.MjrRect(0, 0, resolution[0], resolution[1])
-        mujoco.mjv_updateScene(model, data, mujoco.MjvOption(
-        ), mujoco.MjvPerturb(), camera, mujoco.mjtCatBit.mjCAT_ALL, scene)
-        mujoco.mjr_render(viewport, scene, context)
-        rgb = np.zeros((resolution[1], resolution[0], 3), dtype=np.uint8)
-        mujoco.mjr_readPixels(rgb, None, viewport, context)
-        bgr = cv2.cvtColor(np.flipud(rgb), cv2.COLOR_RGB2BGR)
+        if control_step % control_decimation == 0:
+            # track camera cv2
+            viewport = mujoco.MjrRect(0, 0, resolution[0], resolution[1])
+            mujoco.mjv_updateScene(model, data, mujoco.MjvOption(
+            ), mujoco.MjvPerturb(), camera, mujoco.mjtCatBit.mjCAT_ALL, scene)
+            mujoco.mjr_render(viewport, scene, context)
+            rgb = np.zeros((resolution[1], resolution[0], 3), dtype=np.uint8)
+            mujoco.mjr_readPixels(rgb, None, viewport, context)
+            bgr = cv2.cvtColor(np.flipud(rgb), cv2.COLOR_RGB2BGR)
 
-        # detector apriltag
-        gray_image = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        tags = detector.detect(gray_image)
-        if len(tags) > 0:
-            for tag in tags:
-                # print(f"detected tag ID: {tag.tag_id}")
-                img_points = np.array(tag.corners, dtype=np.float32)
-                success, rvec, tvec = solvePnP(
-                    object_points,
-                    img_points,
-                    CAMERA_MATRIX,
-                    DIST_COEFFS,
-                    flags=cv2.SOLVEPNP_ITERATIVE
-                )
-                if success:
-                    cv2.drawFrameAxes(bgr, CAMERA_MATRIX,
-                                      DIST_COEFFS, rvec, tvec, 0.1)
+            # detector apriltag
+            gray_image = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            tags = detector.detect(gray_image)
+            if len(tags) > 0:
+                for tag in tags:
+                    # print(f"detected tag ID: {tag.tag_id}")
+                    img_points = np.array(tag.corners, dtype=np.float32)
+                    success, rvec, tvec = solvePnP(
+                        object_points,
+                        img_points,
+                        CAMERA_MATRIX,
+                        DIST_COEFFS,
+                        flags=cv2.SOLVEPNP_ITERATIVE
+                    )
+                    if success:
+                        cv2.drawFrameAxes(bgr, CAMERA_MATRIX,
+                                          DIST_COEFFS, rvec, tvec, 0.1)
 
-            # est velocity
-            curr_tvec = tvec.flatten()      # [x, y, z]
-            dx = curr_tvec[0]
-            dy = curr_tvec[1]
-            dz = curr_tvec[2]
-            if last_tvec is not None:
-                vel = (curr_tvec - last_tvec) / dt
-            else:
-                vel = np.zeros(3)
+                # get quat
+                quat = data.sensor("body_quat").data
+                p, q, r = data.sensor("body_gyro").data
+                R_body_to_world = quaternion_to_R(quat).T       # ! .T
+                phi, theta, psi = rot_to_rpy_zxy(R_body_to_world)
+                p_cam_in_body = np.array([0.0, 0.0, -0.01])
+                R_cam_to_body = np.eye(3)
+                p_tag_in_boat = np.array([0.0, 0.0, 0.05])
 
-            state = np.concatenate([[-dx, -dy, dz], vel])
+                # TODO boat attutite
 
-            control_cmd = solve_mpc(
-                state, target_height=1.0)  # TODO height
-            roll = control_cmd[0]
-            pitch = control_cmd[1]
-            thrust_z = control_cmd[2]
+                p_tag_in_body = R_cam_to_body @ tvec.flatten() + p_cam_in_body
+                # p_drone_in_world = R_body_to_world @ p_tag_in_body + p_tag_in_boat
+                p_drone_in_world = data.body("cf2").xpos.copy()  # TODO test
 
-            hover_thrust = (mq * g0) / 4
+                # solve MPC
+                # est velocity TODO
+                pos_rel = p_drone_in_world
+                if last_pos_rel is not None:
+                    vel_rel = (pos_rel - last_pos_rel) / dt_control
+                else:
+                    vel_rel = np.zeros(3)
 
-            data.ctrl[0] = hover_thrust + roll - pitch
-            data.ctrl[1] = hover_thrust - roll - pitch
-            data.ctrl[2] = hover_thrust - roll + pitch
-            data.ctrl[3] = hover_thrust + roll + pitch
+                state = np.concatenate([pos_rel, vel_rel])
 
-            last_tvec = curr_tvec
-        else:
-            # lost tag
-            data.ctrl[:] = hover_thrust
+                target_height = 1.0     # TODO height
+                B = build_B(psi, dt_control, g0)
+                u_cmd = solve_mpc(
+                    state, target_height, Q, R, A, B, dt_control, N=30)
+                if u_cmd is not None and not np.all(u_cmd == 0):
+                    last_u_cmd = u_cmd.copy()
+                else:
+                    u_cmd = last_u_cmd
+                    print("MPC failed")
+                theta_des, phi_des, accel_z_cmd = u_cmd
 
-        # show track camera
-        bgr = cv2.resize(bgr, (640, 480))
-        cv2.imshow('MuJoCo Camera Output', bgr)
+                e_phi = phi_des - phi
+                e_theta = theta_des - theta
+                psi_des = 0
+                e_psi = psi_des - psi
+
+                # WTF TODO error
+                tau_theta = Kp_roll * e_phi + Kd_roll * (0 - p)
+                tau_phi = Kp_pitch * e_theta + Kd_pitch * (0 - q)
+                tau_psi = Kp_yaw * e_psi + Kd_yaw * (0 - r)
+
+                T_total = mq * (g0 + accel_z_cmd)
+
+                # kappa = 1e-9
+                F1 = T_total/4 + tau_theta / \
+                    (2*l) - tau_phi/(2*l) - tau_psi/(4*l)
+                F2 = T_total/4 - tau_theta / \
+                    (2*l) - tau_phi/(2*l) + tau_psi/(4*l)
+                F3 = T_total/4 - tau_theta / \
+                    (2*l) + tau_phi/(2*l) - tau_psi/(4*l)
+                F4 = T_total/4 + tau_theta / \
+                    (2*l) + tau_phi/(2*l) + tau_psi/(4*l)
+
+                des_forces = np.array([F1, F2, F3, F4])
+                data.ctrl[:] = np.clip(des_forces, 0, 0.1573) / 0.1573
+
+                # debug
+                print("tvec: ", tvec)
+                print("p_tag_in_body: ", p_tag_in_body,
+                      "p_drone_in_world", p_drone_in_world)
+                # print("mujoco_cf2_xpos:", data.body("cf2").xpos)
+                # print("mujoco_cf2_quat:", data.body("cf2").xquat)
+
+                print("throttles: ", data.ctrl[:])
+                print("mujoco actuator force", data.actuator_force)
+                print(f"u_cmd: roll={u_cmd[0]:.3f}, pitch={
+                      u_cmd[1]:.3f}, accel_z={u_cmd[2]:.3f}")
+                print(f"state: pos={state[:3]}, vel={state[3:]}")
+
+                last_pos_rel = pos_rel
+
+            # show track camera
+            bgr = cv2.resize(bgr, (640, 480))
+            cv2.imshow('MuJoCo Camera Output', bgr)
+        # else:
+            #     # lost tag
+            #     # data.ctrl[:] = mq * g0 / 4
+            # print("no tag")
+            #     data.ctrl[:] = 1
 
         if cv2.waitKey(1) == 27:
             break

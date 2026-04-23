@@ -34,5 +34,11 @@ class QuadParams:
         self.FM_omega2 = np.array([
             [self.kforce, self.kforce, self.kforce, self.kforce],
             [0.0, self.armlength * self.kforce, 0.0, -self.armlength * self.kforce],
-            [-self.]
+            [-self.armlength * self.kforce, 0.0,
+                self.armlength * self.kforce, 0.0],
+            [self.kmoment, -self.kmoment, self.kmoment, -self.kmoment],
         ])
+        self.omega2_FM = np.linalg.inv(self.FM_omega2)
+
+        self.maxomega = np.sqrt(self.maxF / (4.0 * self.kforce))
+        self.minomega = np.sqrt(self.minF / (4.0 * self.kforce))
