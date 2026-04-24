@@ -66,11 +66,10 @@
   </asset>
 
   <worldbody>
-    <body name="cf2" pos="0.0 0.05 0.3" childclass="cf2">
+    <body name="cf2" pos="0.5 0.5 5.0" childclass="cf2">
       <freejoint />
       <inertial pos="0 0 0" mass="0.033" diaginertia="1.395e-5 1.395e-5 2.173e-5" />
-      <!-- <camera name="track" pos="-1 0 .5" xyaxes="0 -1 0 1 0 2" mode="trackcom" /> -->
-      <camera name="track" pos="0 0 -0.01" xyaxes="1 0 0 0 1 0" fovy="120" />
+      <camera name="drone_camera" pos="0 0 -0.01" xyaxes="1 0 0 0 1 0" fovy="120" />
       <geom mesh="cf2_0" material="propeller_plastic" class="visual" />
       <geom mesh="cf2_1" material="medium_gloss_plastic" class="visual" />
       <geom mesh="cf2_2" material="polished_gold" class="visual" />

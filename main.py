@@ -1,285 +1,198 @@
-from src.math_utils import quaternion_to_R, rot_to_rpy_zxy
-import numpy as np
-import cvxpy as cp
-import cv2
-from cv2 import solvePnP
-import glfw
 import mujoco
-import mujoco.viewer
-from pupil_apriltags import Detector
+from mujoco.glfw import glfw
+import torch
+import cv2
+import numpy as np
 
 import os
-os.environ["MUJOCO_GL"] = "egl"
+os.environ["MUJOCO_GL"] = "glfw"
 
+gravity = 9.0866        # m/s^2
+mass = 0.033            # kg
+Ct = 3.25e-4            # N/krpm^2
+Cd = 7.9379e-6          # Nm/krpm^2
+arm_length = 0.065/2.0      # m
+max_thrust = 0.1573         # N
+max_torque = 3.842e-03      # Nm
 
-# params
-dt_sim = 1/120
-control_decimation = 2
-dt_control = control_decimation * dt_sim
-control_step = 0
+dt_sim = 0.01
+decimation = 2
+dt_control = dt_sim * decimation
 
-# drone params
-g0 = 9.8066
-mq = 33e-3
-Ixx = 1.395e-5
-Iyy = 1.395e-5
-Izz = 2.173e-5
-Cd = 7.9379e-06
-Ct = 3.25e-4
-dq = 65e-3
-l = dq/2
+control_counter = 0
+log_count = 0
 
-A = np.eye(6)
-A[0, 3] = A[1, 4] = A[2, 5] = dt_control
+def load_model(m=None, d=None):
+    mujoco.set_mjcb_control(None)
+    m = mujoco.MjModel.from_xml_path("./crazyfile/scene.xml")
+    d = mujoco.MjData(m)
+    mujoco.set_mjcb_control(None)
+    
+    m.opt.timestep = dt_sim
+    return m, d
 
-B = np.zeros((6, 3))    # u = [angle_x, angle_y, acceleration_z]
-B[3, 0] = g0 * dt_control
-B[4, 1] = g0 * dt_control
-B[5, 2] = dt_control
-B[0, 0] = 0.5 * g0 * dt_control**2
-B[1, 1] = 0.5 * g0 * dt_control**2
-B[2, 2] = 0.5 * dt_control**2
+def get_state(data):
+    _pos = data.qpos
+    _vel = data.qvel
+    _sensor = data.sensordata
+    gyro = _sensor[0:3]      # x, y, z
+    acc  = _sensor[3:6]
+    quat = _sensor[6:10]     # x, y, z, w
+    return torch.tensor([
+        _pos[0], _pos[1], _pos[2],
+        quat[3], quat[0], quat[1], quat[2],   # w, x, y, z
+        _vel[0], _vel[1], _vel[2],
+        gyro[0], gyro[1], gyro[2]
+    ])
 
-# state: [px, py, pz, vx, vy, vz]
-Q = np.diag([10, 10, 200, 20.0, 20.0, 50.0])
-# control: [roll_cmd, pitch_cmd, accel_z_cmd]
-R = np.diag([0.5, 0.5, 0.05])
+def apply_control(m, d, current_state, goal_position):
+    # 暂时用固定值，后期替换成你的控制器
+    ctrl = 0.51
+    d.actuator('motor1').ctrl[0] = ctrl
+    d.actuator('motor2').ctrl[0] = ctrl
+    d.actuator('motor3').ctrl[0] = ctrl
+    d.actuator('motor4').ctrl[0] = ctrl
 
-# mixer gain
-Kp_roll = 0.005
-Kd_roll = 0.00011
-Kp_pitch = 0.005
-Kd_pitch = 0.00011
-Kp_yaw = 0.005
-Kd_yaw = 0.00011
+def control_callback(m, d):
+    global log_count, gravity, mass, controller
+    _pos = d.qpos
+    _vel = d.qvel
+    _sensor_data = d.sensordata
+    gyro_x = _sensor_data[0]
+    gyro_y = _sensor_data[1]
+    gyro_z = _sensor_data[2]
+    acc_x = _sensor_data[3]
+    acc_y = _sensor_data[4]
+    acc_z = _sensor_data[5]
+    quat_w = _sensor_data[6]
+    quat_x = _sensor_data[7]
+    quat_y = _sensor_data[8]
+    quat_z = _sensor_data[9]
+    quat = torch.tensor([quat_x, quat_y, quat_z, quat_w])  # x y z w
+    omega = torch.tensor([gyro_x, gyro_y, gyro_z])         # 角速度
+    # 构建当前状态
+    current_state = torch.tensor([_pos[0], _pos[1], _pos[2], quat[3], quat[0], quat[1], quat[2], _vel[0], _vel[1], _vel[2], omega[0], omega[1], omega[2]])
+    # 位置控制模式 目标位点
+    goal_position = torch.tensor([0.0, 0.0, 0.5])
 
+    # # NMPC Update
+    # _dt, _control = controller.nmpc_position_control(current_state, goal_position)
+    # d.actuator('motor1').ctrl[0] = calc_motor_input(_control[0])
+    # d.actuator('motor2').ctrl[0] = calc_motor_input(_control[1])
+    # d.actuator('motor3').ctrl[0] = calc_motor_input(_control[2])
+    # d.actuator('motor4').ctrl[0] = calc_motor_input(_control[3])
+    
+    # debug
+    d.actuator('motor1').ctrl[0] = 0.51
+    d.actuator('motor2').ctrl[0] = 0.51
+    d.actuator('motor3').ctrl[0] = 0.51
+    d.actuator('motor4').ctrl[0] = 0.51
 
-def build_B(psi, dt, g):
-    c = np.cos(psi)
-    s = np.sin(psi)
-    B = np.zeros((6, 3))
+    log_count += 1
+    if log_count >= 50:
+        log_count = 0
+        # 这里输出log
 
-    B[0, 0] = 0.5 * g * dt**2 * c
-    B[0, 1] = 0.5 * g * dt**2 * s
-    B[1, 0] = 0.5 * g * dt**2 * s
-    B[1, 1] = -0.5 * g * dt**2 * c
-    B[2, 2] = 0.5 * dt**2
+if __name__ == '__main__':
+    glfw.init()
+    window = glfw.create_window(1200, 900, "CF2 with Camera", None, None)
+    glfw.make_context_current(window)
+    glfw.swap_interval(1)
 
-    B[3, 0] = g * dt * c
-    B[3, 1] = g * dt * s
-    B[4, 0] = g * dt * s
-    B[4, 1] = -g * dt * c
-    B[5, 2] = dt
-    return B
+    # 加载模型
+    model, data = load_model()
 
+    # 创建可视化数据结构
+    cam = mujoco.MjvCamera()          # 主视角相机
+    opt = mujoco.MjvOption()
+    mujoco.mjv_defaultOption(opt)
+    scene = mujoco.MjvScene(model, maxgeom=10000)
+    context = mujoco.MjrContext(model, mujoco.mjtFontScale.mjFONTSCALE_150.value)
 
-def solve_mpc(state, target_height, Q, R, A, B, dt, N=50):
-    u = cp.Variable((3, N))     # control: pitch, roll, thrust
-    x = cp.Variable((6, N + 1))     # state: [pos, vel]
+    opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = True
 
-    goal = np.array([0, 0, target_height, 0, 0, 0])
+    opt.frame = mujoco.mjtFrame.mjFRAME_BODY
 
-    cost = 0
-    constraints = [x[:, 0] == state]
+    # 设置默认相机参数（可选）
+    # mujoco.mjv_defaultCamera(cam)
+    # mujoco.mjv_defaultOption(opt)
+    # cam.azimuth = 90
+    # cam.elevation = -30
+    # cam.distance = 2
+    # cam.lookat = np.array([0.0, 0.0, 0.5])
 
-    for t in range(N):
-        cost += cp.quad_form(x[:, t] - goal, Q)
-        cost += cp.quad_form(u[:, t], R)
+    # 目标位置（悬停）
+    goal_position = torch.tensor([0.0, 0.0, 0.5])
 
-        # dynamics
-        constraints += [x[:, t+1] == A @ x[:, t] + B @ u[:, t]]
+    # 小窗口摄像头设置
+    camera_name = 'drone_camera'
+    camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
+    offcam = mujoco.MjvCamera()
+    offcam.type = mujoco.mjtCamera.mjCAMERA_FIXED
+    offcam.fixedcamid = camera_id
 
-        # print("A: ", A, "B: ", B)
+    # 小窗口尺寸（放在主窗口右下角）
+    small_width, small_height = 256, 192  # 可根据需要调整
 
-        # physical
-        constraints += [u[0, t] <= 0.3, u[0, t] >= - 0.3]  # roll angle
-        constraints += [u[1, t] <= 0.3, u[1, t] >= - 0.3]  # pitch angle
-        constraints += [u[2, t] <= 5.0, u[2, t] >= - 2.0]  # accele_z
+    # 主循环
+    control_time_accum = 0.0
+    sim_time = 0.0
+    while not glfw.window_should_close(window):
+        # 计算视口大小
+        viewport_width, viewport_height = glfw.get_framebuffer_size(window)
+        main_viewport = mujoco.MjrRect(0, 0, viewport_width, viewport_height)
 
-    prob = cp.Problem(cp.Minimize(cost), constraints)
-    prob.solve(solver=cp.OSQP, verbose=False)
-    # if prob.status not in ["optimal", "optimal_inaccurate"]:
-    #     print("MPC not optimal", prob.status)
-    #     return np.zeros(3)  # last
+        # --- 物理与控制更新 ---
+        # 按 dt_sim 步进，每 decimation 步执行一次控制
+        for _ in range(decimation):
+            # 注意：data.time 会自动累积，这里我们也可以用 while 循环保证时间差
+            # 简单起见，直接 mj_step 一次（它按 model.opt.timestep 步进）
+            # 确保 model.opt.timestep == dt_sim
+            mujoco.mj_step(model, data)
 
-    # print("prob: ", prob.status)
+        # 控制周期到了，执行控制
+        control_time_accum += dt_control
+        # 实际 data.time 是物理时间，控制依赖物理时间
+        current_state = get_state(data)
+        apply_control(model, data, current_state, goal_position)
 
-    return u[:, 0].value
+        # 日志输出（每 50 次控制循环）
+        log_count += 1
+        if log_count >= 50:
+            log_count = 0
+            # print(f"Time: {data.time:.3f}, Pos: {data.qpos[0:3]}")
+            pass
 
+        # --- 渲染主窗口 ---
+        mujoco.mjv_updateScene(model, data, opt, None, cam,
+                               mujoco.mjtCatBit.mjCAT_ALL.value, scene)
+        mujoco.mjr_render(main_viewport, scene, context)
 
-# openGL drone track camera
-resolution = (1920, 1080)
-glfw.init()
-glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
-window = glfw.create_window(
-    resolution[0], resolution[1], "Offscreen", None, None)
-glfw.make_context_current(window)
+        # --- 小窗摄像头（无人机视角） ---
+        # 小窗位置：右下角
+        loc_x = viewport_width - small_width
+        loc_y = viewport_height - small_height
+        off_viewport = mujoco.MjrRect(loc_x, loc_y, small_width, small_height)
 
-# MuJoCo setup
-model = mujoco.MjModel.from_xml_path("./crazyfile/scene.xml")
-data = mujoco.MjData(model)
-scene = mujoco.MjvScene(model, maxgeom=10000)
-context = mujoco.MjrContext(model, mujoco.mjtFontScale.mjFONTSCALE_150.value)
+        # 更新并渲染 fixed camera 视角
+        mujoco.mjv_updateScene(model, data, opt, None, offcam,
+                               mujoco.mjtCatBit.mjCAT_ALL.value, scene)
+        mujoco.mjr_render(off_viewport, scene, context)
 
-# set camera
-camera_name = "track"
-camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
-camera = mujoco.MjvCamera()
-camera.type = mujoco.mjtCamera.mjCAMERA_FIXED
-if camera_id != -1:
-    print("camera_id", camera_id)
-    camera.fixedcamid = camera_id
+        # 用 OpenCV 显示这个小窗图像（可选）
+        # 读取像素
+        rgb = np.zeros((small_height, small_width, 3), dtype=np.uint8)
+        depth = np.zeros((small_height, small_width), dtype=np.float32)
+        mujoco.mjr_readPixels(rgb, depth, off_viewport, context)
+        # OpenCV 显示图像（需要垂直翻转）
+        rgb_flipped = cv2.flip(rgb, 0)
+        bgr = cv2.cvtColor(rgb_flipped, cv2.COLOR_RGB2BGR)
+        cv2.imshow("Drone Camera", bgr)
+        cv2.waitKey(1)
 
-# frame buffer
-frambuffer = mujoco.MjrRect(0, 0, resolution[0], resolution[1])
-mujoco.mjr_setBuffer(mujoco.mjtFramebuffer.mjFB_OFFSCREEN, context)
+        # 交换缓冲区、处理事件
+        glfw.swap_buffers(window)
+        glfw.poll_events()
 
-# april tag
-detector = Detector(families="tag36h11", nthreads=1, quad_decimate=1.0,
-                    refine_edges=1)
-TAG_SIZE = 0.1
-half_s = TAG_SIZE / 2
-object_points = np.array([
-    [-half_s, half_s, 0],
-    [half_s, half_s, 0],
-    [half_s, -half_s, 0],
-    [-half_s, -half_s, 0],
-], dtype=np.float32)
-CAMERA_MATRIX = np.array([
-    [554.26, 0, 960],
-    [0, 554.26, 540],
-    [0, 0, 1]
-], dtype=np.float32)
-DIST_COEFFS = np.zeros((5, 1), dtype=np.float32)
-
-# setup params
-last_pos_rel = None
-vel_rel = np.zeros(3)
-last_u_cmd = np.array([0.0, 0.0, 0.0])
-with mujoco.viewer.launch_passive(model, data) as viewer:
-    while viewer.is_running():
-        mujoco.mj_step(model, data)
-        control_step += 1
-        # print("control_step: ", control_step)
-        viewer.sync()
-
-        if control_step % control_decimation == 0:
-            # track camera cv2
-            viewport = mujoco.MjrRect(0, 0, resolution[0], resolution[1])
-            mujoco.mjv_updateScene(model, data, mujoco.MjvOption(
-            ), mujoco.MjvPerturb(), camera, mujoco.mjtCatBit.mjCAT_ALL, scene)
-            mujoco.mjr_render(viewport, scene, context)
-            rgb = np.zeros((resolution[1], resolution[0], 3), dtype=np.uint8)
-            mujoco.mjr_readPixels(rgb, None, viewport, context)
-            bgr = cv2.cvtColor(np.flipud(rgb), cv2.COLOR_RGB2BGR)
-
-            # detector apriltag
-            gray_image = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-            tags = detector.detect(gray_image)
-            if len(tags) > 0:
-                for tag in tags:
-                    # print(f"detected tag ID: {tag.tag_id}")
-                    img_points = np.array(tag.corners, dtype=np.float32)
-                    success, rvec, tvec = solvePnP(
-                        object_points,
-                        img_points,
-                        CAMERA_MATRIX,
-                        DIST_COEFFS,
-                        flags=cv2.SOLVEPNP_ITERATIVE
-                    )
-                    if success:
-                        cv2.drawFrameAxes(bgr, CAMERA_MATRIX,
-                                          DIST_COEFFS, rvec, tvec, 0.1)
-
-                # get quat
-                quat = data.sensor("body_quat").data
-                p, q, r = data.sensor("body_gyro").data
-                R_body_to_world = quaternion_to_R(quat).T       # ! .T
-                phi, theta, psi = rot_to_rpy_zxy(R_body_to_world)
-                p_cam_in_body = np.array([0.0, 0.0, -0.01])
-                R_cam_to_body = np.eye(3)
-                p_tag_in_boat = np.array([0.0, 0.0, 0.05])
-
-                # TODO boat attutite
-
-                p_tag_in_body = R_cam_to_body @ tvec.flatten() + p_cam_in_body
-                # p_drone_in_world = R_body_to_world @ p_tag_in_body + p_tag_in_boat
-                p_drone_in_world = data.body("cf2").xpos.copy()  # TODO test
-
-                # solve MPC
-                # est velocity TODO
-                pos_rel = p_drone_in_world
-                if last_pos_rel is not None:
-                    vel_rel = (pos_rel - last_pos_rel) / dt_control
-                else:
-                    vel_rel = np.zeros(3)
-
-                state = np.concatenate([pos_rel, vel_rel])
-
-                target_height = 1.0     # TODO height
-                B = build_B(psi, dt_control, g0)
-                u_cmd = solve_mpc(
-                    state, target_height, Q, R, A, B, dt_control, N=30)
-                if u_cmd is not None and not np.all(u_cmd == 0):
-                    last_u_cmd = u_cmd.copy()
-                else:
-                    u_cmd = last_u_cmd
-                    print("MPC failed")
-                theta_des, phi_des, accel_z_cmd = u_cmd
-
-                e_phi = phi_des - phi
-                e_theta = theta_des - theta
-                psi_des = 0
-                e_psi = psi_des - psi
-
-                # WTF TODO error
-                tau_theta = Kp_roll * e_phi + Kd_roll * (0 - p)
-                tau_phi = Kp_pitch * e_theta + Kd_pitch * (0 - q)
-                tau_psi = Kp_yaw * e_psi + Kd_yaw * (0 - r)
-
-                T_total = mq * (g0 + accel_z_cmd)
-
-                # kappa = 1e-9
-                F1 = T_total/4 + tau_theta / \
-                    (2*l) - tau_phi/(2*l) - tau_psi/(4*l)
-                F2 = T_total/4 - tau_theta / \
-                    (2*l) - tau_phi/(2*l) + tau_psi/(4*l)
-                F3 = T_total/4 - tau_theta / \
-                    (2*l) + tau_phi/(2*l) - tau_psi/(4*l)
-                F4 = T_total/4 + tau_theta / \
-                    (2*l) + tau_phi/(2*l) + tau_psi/(4*l)
-
-                des_forces = np.array([F1, F2, F3, F4])
-                data.ctrl[:] = np.clip(des_forces, 0, 0.1573) / 0.1573
-
-                # debug
-                print("tvec: ", tvec)
-                print("p_tag_in_body: ", p_tag_in_body,
-                      "p_drone_in_world", p_drone_in_world)
-                # print("mujoco_cf2_xpos:", data.body("cf2").xpos)
-                # print("mujoco_cf2_quat:", data.body("cf2").xquat)
-
-                print("throttles: ", data.ctrl[:])
-                print("mujoco actuator force", data.actuator_force)
-                print(f"u_cmd: roll={u_cmd[0]:.3f}, pitch={
-                      u_cmd[1]:.3f}, accel_z={u_cmd[2]:.3f}")
-                print(f"state: pos={state[:3]}, vel={state[3:]}")
-
-                last_pos_rel = pos_rel
-
-            # show track camera
-            bgr = cv2.resize(bgr, (640, 480))
-            cv2.imshow('MuJoCo Camera Output', bgr)
-        # else:
-            #     # lost tag
-            #     # data.ctrl[:] = mq * g0 / 4
-            # print("no tag")
-            #     data.ctrl[:] = 1
-
-        if cv2.waitKey(1) == 27:
-            break
-
-cv2.destroyAllWindows()
-glfw.terminate()
-del context
-del scene
+    cv2.destroyAllWindows()
+    glfw.terminate()
