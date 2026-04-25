@@ -21,7 +21,7 @@
     <material name="medium_gloss_plastic" rgba="0.109 0.184 0.0 1" />
     <material name="propeller_plastic" rgba="0.792 0.820 0.933 1" />
     <material name="white" rgba="1 1 1 1" />
-    <material name="body_frame_plastic" rgba="0.102 0.102 0.102 1" />
+    <material name="body_frame_plastic" rgba="0.102 0.102 0.102 0.1" />
     <material name="burnished_chrome" rgba="0.898 0.898 0.898 1" />
 
     <mesh file="cf2_0.obj" />
@@ -66,7 +66,7 @@
   </asset>
 
   <worldbody>
-    <body name="cf2" pos="1.5 1.5 1.0" childclass="cf2">
+    <body name="cf2" pos="1.0 1.0 1.0" childclass="cf2">
       <freejoint />
       <inertial pos="0 0 0" mass="0.033" diaginertia="1.395e-5 1.395e-5 2.173e-5" />
       <camera name="drone_camera" pos="0 0 -0.01" xyaxes="1 0 0 0 1 0" fovy="120" />

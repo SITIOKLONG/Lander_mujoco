@@ -51,18 +51,20 @@ DIST_COEFFS = np.zeros(4, dtype=np.float32)   # 假设使用 k1,k2,p1,p2 模型
 
 
 P_cam_in_body = torch.tensor([0.0, 0.0, -0.05], dtype=torch.float32)
-# R_cam_to_body = torch.tensor([  # TODO
-#     [0, 1, 0],
-#     [-1, 0, 0],
-#     [0, 0, -1]
-# ], dtype=torch.float32)   # 绕 x 轴转 180°
-R_cam_to_body = torch.eye(3)        # from mujoco
+R_cam_to_body = torch.tensor([  # TODO
+    [1, 0, 0],
+    [0, -1, 0],
+    [0, 0, -1]
+], dtype=torch.float32)
 control_pos_error = torch.Tensor([0.0, 0.0, 2.0])
 
 
 log_count = 0
+pad_quat_prev = torch.Tensor([1,0,0,0])
+filtered_pad_ang_vel_w = torch.Tensor([0,0,])
+first_apriltag_detected = False
 def cv_apriltag(raw_image_, m, d):
-    global log_count, control_pos_error, tag_detected
+    global log_count, control_pos_error, tag_detected, pad_quat_prev, first_apriltag_detected, filtered_pad_ang_vel_w
     rgb_drone_camera = cv2.cvtColor(cv2.flip(raw_image_, 0), cv2.COLOR_RGB2BGR)
     gray_image = cv2.cvtColor(rgb_drone_camera, cv2.COLOR_BGR2GRAY)
     tags = detector.detect(gray_image)
@@ -82,33 +84,50 @@ def cv_apriltag(raw_image_, m, d):
                 tag_detected = True
                 cv2.drawFrameAxes(rgb_drone_camera, CAMERA_MATRIX, DIST_COEFFS, rvec, tvec, 0.1)
 
-                # calculate pos error
+                # calculate pos error for controller
                 P_tag_in_cam = torch.from_numpy(tvec.ravel()).float()
                 P_tag_in_body = R_cam_to_body @ P_tag_in_cam + P_cam_in_body
+                # print(f"P_tag_in_body: {P_tag_in_body}")
 
                 _sensor = torch.from_numpy(d.sensordata).float()
                 quat  = _sensor[6:10]         # [w, x, y, z]
                 R_body_to_world = rotation_matrix(
                     quat[0].item(), quat[1].item(), quat[2].item(), quat[3].item()
                 ).float()
-                P_tag_from_body_W = R_body_to_world @ P_tag_in_body
+                P_tag_from_body_w = R_body_to_world @ P_tag_in_body
+                # print(f"P_tag_from_body_w: {P_tag_from_body_w}")
 
-                P_des_body_from_pad_W = torch.tensor([0.0, 0.0, 0.5], dtype=torch.float32)
-                P_body_from_tag_W = -P_tag_from_body_W
-                control_pos_error = P_des_body_from_pad_W - (P_body_from_tag_W)
+                P_des_body_from_pad_w = torch.tensor([0.0, 0.0, 1.5], dtype=torch.float32)
+                P_body_from_tag_w = -P_tag_from_body_w
+                control_pos_error = P_des_body_from_pad_w - (P_body_from_tag_w)
 
 # 获取真实的世界位置
-                body_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, 'cf2')
-                pad_id  = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, 'wave_pad')
-                p_body_true = d.xpos[body_id]   # 机体世界位置
-                p_pad_true  = d.xpos[pad_id]    # 标签世界位置 (假设 pad 中心就是标签)
-                P_body_from_tag_true = p_body_true - p_pad_true   # numpy数组
+                # body_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, 'cf2')
+                # pad_id  = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, 'wave_pad')
+                # p_body_true = d.xpos[body_id]   # 机体世界位置
+                # p_pad_true  = d.xpos[pad_id]    # 标签世界位置 (假设 pad 中心就是标签)
+                # P_body_from_tag_true = p_body_true - p_pad_true   # numpy数组
+                #
+                # print(f"真实 P_body_from_tag: {P_body_from_tag_true}")
+                # print(f"计算 P_body_from_tag_w: {P_body_from_tag_w.numpy()}")
+                # print(f"真实高度差: {P_body_from_tag_true[2]}")
+                #
+                # print(f"P_des_body_from_pad_w: {P_des_body_from_pad_w} | P_body_from_tag_w: {P_body_from_tag_w} | error: {control_pos_error}")
 
-                print(f"真实 P_body_from_tag: {P_body_from_tag_true}")
-                print(f"计算 P_body_from_tag_W: {P_body_from_tag_W.numpy()}")
-                print(f"真实高度差: {P_body_from_tag_true[2]}")
 
-                print(f"P_des_body_from_pad_W: {P_des_body_from_pad_W} | P_body_from_tag_W: {P_body_from_tag_W} | error: {control_pos_error}")
+                # get pad quat for nn model obs
+                R_tag_to_cam, _ = cv2.Rodrigues(rvec)
+                R_tag_to_cam = torch.from_numpy(R_tag_to_cam).float()   # 转 torch 张量方便后续运算
+                R_tag_to_world = R_body_to_world @ R_cam_to_body @ R_tag_to_cam
+                pad_quat = rotation_matrix_to_quat_wxyz(R_tag_to_world)
+                pad_ang_vel_w = quat_to_ang_vel_wxyz(pad_quat_prev, pad_quat, dt_sim)
+                if first_apriltag_detected is False:
+                    filtered_pad_ang_vel_w = pad_ang_vel_w
+                filtered_pad_ang_vel_w = 0.9 * filtered_pad_ang_vel_w + 0.1 * pad_ang_vel_w
+
+                print(f"pad_quat: {pad_quat} | pad_quat_last: {pad_quat_prev} | pad_ang_vel_w: {filtered_pad_ang_vel_w}")
+                pad_quat_prev = pad_quat
+                first_apriltag_detected = True
             else:
                 tag_detected = False
 
@@ -119,8 +138,8 @@ def cv_apriltag(raw_image_, m, d):
                 pass
 
 
-    cv2.imshow("Drone Camera 1920x1080", rgb_drone_camera)    # bug
-    cv2.waitKey(1)
+    # cv2.imshow("Drone Camera 1920x1080", rgb_drone_camera)    # bug
+    # cv2.waitKey(1)
 
 
 
@@ -150,7 +169,7 @@ if __name__ == '__main__':
     cam.lookat = np.array([0, 0, 0])          # 相对于 body 的注视点（0 就是 body 中心）
     cam.distance = 2.0                        # 相机距离注视点的距离
     cam.azimuth = 90                          # 在水平面内的角度（度）
-    cam.elevation = -60                       # 俯仰角
+    cam.elevation = -30                       # 俯仰角
 
     # drone camera setting
     camera_name = 'drone_camera'

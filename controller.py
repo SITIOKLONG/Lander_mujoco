@@ -12,6 +12,7 @@ max_thrust = 0.1573
 
 log_count = 0
 
+
 def attitude_error_quat(q_curr_: torch.Tensor, q_des_: torch.Tensor) -> torch.Tensor:
     if torch.dot(q_curr_, q_des_) < 0:
         q_des_ = -q_des_
@@ -19,8 +20,10 @@ def attitude_error_quat(q_curr_: torch.Tensor, q_des_: torch.Tensor) -> torch.Te
     q_error = quat_multiply(q_des_inv, q_curr_)
     return 2.0 * q_error[1:]
 
+
 def calc_motor_force(krpm):
     return Ct * krpm ** 2
+
 
 def calc_motor_input(krpm):
     krpm = torch.clamp(krpm, 0, 22)
@@ -28,6 +31,7 @@ def calc_motor_input(krpm):
     inp = force / max_thrust
     inp = torch.clamp(inp, 0, 1)
     return inp
+
 
 def control_callback(m, d, control_pos_error):
     global log_count
@@ -51,12 +55,10 @@ def control_callback(m, d, control_pos_error):
 
     # ---- 步骤 2：位置 + 速度 + 加速度期望 ----
     # goal_position = torch.tensor([0.0, 0.0, 2.0])     # debug test
-    goal_position = control_pos_error
+    Kp_pos = torch.Tensor([2.0, 2.0, 4.0])  # 可分别调节 XY 和 Z
+    v_des = Kp_pos * control_pos_error               # 期望速度
 
-    Kp_pos = 1.0
-    v_des = Kp_pos * (goal_position - _pos[:3])
-
-    Kv_p = 2.5
+    Kv_p = torch.Tensor([2.5, 2.5, 4.0])     # 阻尼增益
     a_des = Kv_p * (v_des - _vel[:3]) + torch.tensor([0.0, 0.0, g0])
 
     # ---- 步骤 3：根据期望加速度计算期望姿态 ----
