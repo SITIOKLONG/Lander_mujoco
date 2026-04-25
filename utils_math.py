@@ -1,6 +1,4 @@
 import torch
-import math
-import numpy as np
 
 # 根据四元数计算旋转矩阵
 def rotation_matrix(q0, q1, q2, q3):
@@ -33,40 +31,59 @@ def quat_inverse(q: torch.Tensor) -> torch.Tensor:
     return torch.tensor([q[0], -q[1], -q[2], -q[3]])
 
 def euler_xyz_to_quat_wxyz(roll, pitch, yaw):
-    """Convert XYZ Euler angles to MuJoCo quaternion order: wxyz."""
+    """
+    Convert XYZ Euler angles (radians) to quaternion (w, x, y, z) – MuJoCo order.
+    Supports scalar tensors or Python numbers.
+    """
+    # Ensure tensors (will be 0-dim if scalar)
+    roll = torch.as_tensor(roll, dtype=torch.float32)
+    pitch = torch.as_tensor(pitch, dtype=torch.float32)
+    yaw = torch.as_tensor(yaw, dtype=torch.float32)
+
     hr = 0.5 * roll
     hp = 0.5 * pitch
     hy = 0.5 * yaw
 
-    cr = math.cos(hr)
-    sr = math.sin(hr)
-    cp = math.cos(hp)
-    sp = math.sin(hp)
-    cy = math.cos(hy)
-    sy = math.sin(hy)
+    cr = torch.cos(hr)
+    sr = torch.sin(hr)
+    cp = torch.cos(hp)
+    sp = torch.sin(hp)
+    cy = torch.cos(hy)
+    sy = torch.sin(hy)
 
     qw = cr * cp * cy + sr * sp * sy
     qx = sr * cp * cy - cr * sp * sy
     qy = cr * sp * cy + sr * cp * sy
     qz = cr * cp * sy - sr * sp * cy
 
-    q = np.array([qw, qx, qy, qz], dtype=np.float64)
-    q_norm = np.linalg.norm(q)
-    if q_norm < 1e-8:
-        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
-    return q / q_norm
+    q = torch.stack([qw, qx, qy, qz], dim=0)   # (4,)
+    q_norm = torch.norm(q)
+    # Avoid division by zero
+    q = torch.where(q_norm < 1e-8, torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32), q / q_norm)
+    return q
 
 
 def quat_to_ang_vel_wxyz(q_prev, q_curr, dt):
+    """
+    Angular velocity (body frame?) from two consecutive quaternions (w,x,y,z) and time step.
+    Returns tensor of shape (3,).
+    """
     if dt <= 0.0:
-        return np.zeros(3, dtype=np.float64)
+        return torch.zeros(3, dtype=torch.float32)
+
+    q_prev = torch.as_tensor(q_prev, dtype=torch.float32)
+    q_curr = torch.as_tensor(q_curr, dtype=torch.float32)
+
+    # Relative rotation: dq = q_prev^{-1} * q_curr
     dq = quat_multiply(quat_inverse(q_prev), q_curr)
-    dq = dq / np.linalg.norm(dq)
-    w = np.clip(dq[0], -1.0, 1.0)
-    angle = 2.0 * math.acos(w)
-    s = math.sqrt(max(1.0 - w * w, 0.0))
-    if s < 1e-8 or angle < 1e-8:
-        axis = np.zeros(3, dtype=np.float64)
-    else:
-        axis = dq[1:] / s
+    dq = dq / torch.norm(dq)   # normalize to avoid drift
+
+    w = torch.clamp(dq[0], -1.0, 1.0)
+    angle = 2.0 * torch.acos(w)
+    s = torch.sqrt(torch.clamp(1.0 - w * w, min=0.0))
+
+    # If s or angle is negligible, axis is zero
+    small_angle = (s < 1e-8) | (angle < 1e-8)
+    axis = torch.where(small_angle, torch.zeros(3, dtype=torch.float32), dq[1:] / s)
+
     return axis * angle / dt

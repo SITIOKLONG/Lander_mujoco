@@ -1,14 +1,14 @@
-import numpy as np
+import torch
 import math
 import mujoco
-
-from utils_math import *
-
+from utils_math import *          # 需保证这些函数已支持 torch.Tensor
 
 DEG2RAD = math.pi / 180.0
 
 class WavePadMotion:
-    """Spectral + OU + smoothing wave motion for a MuJoCo mocap body."""
+    """Spectral + OU + smoothing wave motion for a MuJoCo mocap body.
+       Internal state & calculations are all torch tensors.
+    """
 
     def __init__(
         self,
@@ -27,36 +27,44 @@ class WavePadMotion:
     ):
         self.body_name = body_name
         self.amp_heave = float(amp_heave)
-        self.amp_roll = float(amp_roll_deg) * DEG2RAD
+        self.amp_roll  = float(amp_roll_deg) * DEG2RAD
         self.amp_pitch = float(amp_pitch_deg) * DEG2RAD
-        self.freq_min = float(freq_min)
-        self.freq_max = float(freq_max)
-        self.n_sines = int(n_sines)
-        self.ou_rho = float(ou_rho)
-        self.ou_sigma = float(ou_sigma)
-        self.alpha = float(np.clip(smoother_alpha, 0.0, 1.0))
+        self.freq_min  = float(freq_min)
+        self.freq_max  = float(freq_max)
+        self.n_sines   = int(n_sines)
+        self.ou_rho    = float(ou_rho)
+        self.ou_sigma  = float(ou_sigma)
+        self.alpha     = float(max(0.0, min(1.0, smoother_alpha)))
 
-        self.rng = np.random.default_rng(seed)
+        # Replace numpy RNG with torch generator (CPU)
+        self.rng = torch.Generator().manual_seed(seed)
 
         self.mocap_id = None
         self.dt = 0.01
         self.t = 0.0
-        self.base_pos = None
-        self.base_quat = None
 
-        self.omegas = None
-        self.phases = None
-        self.amps = None
+        # Base pose is initially None; set in bind_model and kept as tensors
+        self.base_pos  = None   # torch.Tensor(3,)
+        self.base_quat = None   # torch.Tensor(4,)  wxyz
 
-        self.ou_state = np.zeros(3, dtype=np.float64)
-        self.smooth_state = np.zeros(3, dtype=np.float64)
-        self.prev_pos = None
+        # Spectrum parameters (tensors)
+        self.omegas = None      # torch.Tensor(n_sines,)
+        self.phases = None      # torch.Tensor(n_sines,)
+        self.amps   = None      # torch.Tensor(3, n_sines)   rows: heave, roll, pitch
+
+        # Filter states
+        self.ou_state     = torch.zeros(3, dtype=torch.float32)
+        self.smooth_state = torch.zeros(3, dtype=torch.float32)
+
+        # For velocity computation
+        self.prev_pos  = None
         self.prev_quat = None
-        self.current_lin_vel = np.zeros(3, dtype=np.float64)
-        self.current_ang_vel = np.zeros(3, dtype=np.float64)
+        self.current_lin_vel  = torch.zeros(3, dtype=torch.float32)
+        self.current_ang_vel  = torch.zeros(3, dtype=torch.float32)
 
-        self.trans_vel = np.array(trans_vel, dtype=np.float64)   # 固定速度向量
-        self.translation = np.zeros(2, dtype=np.float64)         # 累積的水平位移 (x, y)
+        # Horizontal translation
+        self.trans_vel   = torch.tensor(trans_vel, dtype=torch.float32)
+        self.translation = torch.zeros(2, dtype=torch.float32)
 
     def bind_model(self, m, d):
         body_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, self.body_name)
@@ -69,46 +77,54 @@ class WavePadMotion:
 
         self.mocap_id = mocap_id
         self.dt = float(m.opt.timestep)
-        self.base_pos = d.mocap_pos[self.mocap_id].copy()
-        self.base_quat = d.mocap_quat[self.mocap_id].copy()
-        self.prev_pos = self.base_pos.copy()
-        self.prev_quat = self.base_quat.copy()
-        self.current_lin_vel[:] = 0.0
-        self.current_ang_vel[:] = 0.0
+
+        # Store base pose as tensors (copy from mujoco numpy arrays)
+        self.base_pos  = torch.from_numpy(d.mocap_pos[self.mocap_id].copy()).float()
+        self.base_quat = torch.from_numpy(d.mocap_quat[self.mocap_id].copy()).float()
+
+        self.prev_pos  = self.base_pos.clone()
+        self.prev_quat = self.base_quat.clone()
+        self.current_lin_vel.zero_()
+        self.current_ang_vel.zero_()
 
         self.reset(d, resample=True)
 
     def _resample_spectrum(self):
-        freqs_hz = self.rng.uniform(self.freq_min, self.freq_max, size=(self.n_sines,))
-        self.omegas = 2.0 * math.pi * freqs_hz
-        self.phases = self.rng.uniform(0.0, 2.0 * math.pi, size=(self.n_sines,))
-
-        inv_f = 1.0 / np.clip(freqs_hz, 0.05, None)
-        weights = inv_f / np.sum(inv_f)
-
-        self.amps = np.vstack(
-            [
-                self.amp_heave * weights,
-                self.amp_roll * weights,
-                self.amp_pitch * weights,
-            ]
+        """Randomly generate frequencies, phases, and spectral amplitudes."""
+        freqs_hz = self.freq_min + (self.freq_max - self.freq_min) * torch.rand(
+            (self.n_sines,), generator=self.rng, dtype=torch.float32
         )
+        self.omegas = 2.0 * math.pi * freqs_hz
+        self.phases = 2.0 * math.pi * torch.rand(
+            (self.n_sines,), generator=self.rng, dtype=torch.float32
+        )
+
+        inv_f = 1.0 / torch.clamp(freqs_hz, min=0.05)
+        weights = inv_f / inv_f.sum()   # (n_sines,)
+
+        self.amps = torch.stack([
+            self.amp_heave * weights,
+            self.amp_roll  * weights,
+            self.amp_pitch * weights,
+        ], dim=0)   # (3, n_sines)
 
     def reset(self, d, resample=True):
         self.t = 0.0
-        self.translation[:] = 0.0
-        self.ou_state[:] = 0.0
-        self.smooth_state[:] = 0.0
+        self.translation.zero_()
+        self.ou_state.zero_()
+        self.smooth_state.zero_()
+
         if resample or self.omegas is None:
             self._resample_spectrum()
 
         if self.mocap_id is not None:
-            d.mocap_pos[self.mocap_id] = self.base_pos
-            d.mocap_quat[self.mocap_id] = self.base_quat
-            self.prev_pos = self.base_pos.copy()
-            self.prev_quat = self.base_quat.copy()
-            self.current_lin_vel[:] = 0.0
-            self.current_ang_vel[:] = 0.0
+            # Write base pose back to mujoco (tensor → numpy)
+            d.mocap_pos[self.mocap_id]  = self.base_pos.numpy()
+            d.mocap_quat[self.mocap_id] = self.base_quat.numpy()
+            self.prev_pos  = self.base_pos.clone()
+            self.prev_quat = self.base_quat.clone()
+            self.current_lin_vel.zero_()
+            self.current_ang_vel.zero_()
 
     def step(self, d):
         if self.mocap_id is None:
@@ -116,47 +132,48 @@ class WavePadMotion:
 
         self.t += self.dt
 
-        angles = self.omegas * self.t + self.phases
-        sines = np.sin(angles)
-        disturbance = np.sum(self.amps * sines[None, :], axis=1)
+        # ----- 1. Spectral disturbance -----
+        angles = self.omegas * self.t + self.phases   # (n_sines,)
+        sines  = torch.sin(angles)                    # (n_sines,)
+        disturbance = (self.amps * sines.unsqueeze(0)).sum(dim=1)   # (3,)
 
-        noise_scale = np.array([self.amp_heave, self.amp_roll, self.amp_pitch], dtype=np.float64)
-        self.ou_state = self.ou_rho * self.ou_state + self.ou_sigma * noise_scale * self.rng.standard_normal(3)
-        disturbance += self.ou_state
+        # ----- 2. Ornstein–Uhlenbeck noise -----
+        noise_scale = torch.tensor([self.amp_heave, self.amp_roll, self.amp_pitch],
+                                   dtype=torch.float32)
+        # torch.randn generates standard normal, equivalent to numpy standard_normal
+        ou_noise = self.ou_sigma * noise_scale * torch.randn(3, generator=self.rng)
+        self.ou_state = self.ou_rho * self.ou_state + ou_noise
+        disturbance = disturbance + self.ou_state
 
+        # ----- 3. Exponential smoother -----
         self.smooth_state = (1.0 - self.alpha) * self.smooth_state + self.alpha * disturbance
-        z_offset, roll, pitch = self.smooth_state
+        z_offset, roll, pitch = self.smooth_state[0], self.smooth_state[1], self.smooth_state[2]
 
-        prev_pos = d.mocap_pos[self.mocap_id].copy()
-        prev_quat = d.mocap_quat[self.mocap_id].copy()
+        # ----- 4. Update mocap pose (write back to mujoco) -----
+        # Retrieve previous pose from mujoco (used for velocity computation)
+        prev_pos  = torch.from_numpy(d.mocap_pos[self.mocap_id].copy()).float()
+        prev_quat = torch.from_numpy(d.mocap_quat[self.mocap_id].copy()).float()
 
-        # 更新累積的平移量 
-        self.translation += self.trans_vel * self.dt
+        # Horizontal translation accumulation
+        self.translation = self.translation + self.trans_vel * self.dt
 
-        # 計算新位置：base_pos + 水平平移 + 垂直波浪偏移
-        new_pos = self.base_pos.copy()
+        new_pos = self.base_pos.clone()
         new_pos[0] += self.translation[0]
         new_pos[1] += self.translation[1]
         new_pos[2] = self.base_pos[2] + z_offset
-        d.mocap_pos[self.mocap_id] = new_pos
 
-        dq = euler_xyz_to_quat_wxyz(roll, pitch, 0.0)
-        d.mocap_quat[self.mocap_id] = quat_multiply(self.base_quat, dq)
+        # Orientation: base_quat * dq (roll, pitch, 0 yaw)
+        dq = euler_xyz_to_quat_wxyz(roll, pitch, 0.0)   # returns tensor (4,)
+        new_quat = quat_multiply(self.base_quat, dq)
 
-        curr_pos = d.mocap_pos[self.mocap_id].copy()
-        curr_quat = d.mocap_quat[self.mocap_id].copy()
-        self.current_lin_vel = (curr_pos - prev_pos) / self.dt
-        self.current_ang_vel = quat_to_ang_vel_wxyz(prev_quat, curr_quat, self.dt)
-        self.prev_pos = curr_pos
-        self.prev_quat = curr_quat
+        # Assign to MuJoCo (tensor → numpy)
+        d.mocap_pos[self.mocap_id]  = new_pos.numpy()
+        d.mocap_quat[self.mocap_id] = new_quat.numpy()
 
-    # def get_pose(self, d):
-    #     return d.mocap_pos[self.mocap_id].copy(), d.mocap_quat[self.mocap_id].copy()
+        # ----- 5. Compute velocity ---
+        self.current_lin_vel = (new_pos - prev_pos) / self.dt
+        self.current_ang_vel = quat_to_ang_vel_wxyz(prev_quat, new_quat, self.dt)
 
-    # def get_phase_features(self):
-    #     """Return [cos(phase_i), sin(phase_i)] for each active wave component."""
-    #     k = max(int(self.n_sines), 1)
-    #     if self.omegas is None or self.phases is None:
-    #         return np.zeros((2 * k,), dtype=np.float64)
-    #     angles = self.omegas * self.t + self.phases
-    #     return np.concatenate([np.cos(angles), np.sin(angles)]).astype(np.float64)
+        # Update stored previous pose
+        self.prev_pos  = new_pos.clone()
+        self.prev_quat = new_quat.clone()   #     return np.concatenate([np.cos(angles), np.sin(angles)]).astype(np.float64)

@@ -4,12 +4,14 @@ import cv2
 from cv2 import solvePnP
 import numpy as np
 from pupil_apriltags import Detector
+import torch
 
 import os
 os.environ["MUJOCO_GL"] = "glfw"
 
 from controller import control_callback
 from pad import WavePadMotion
+from utils_math import *
 
 # 100Hz 10ms 0.01s
 dt_sim = 0.01
@@ -24,7 +26,7 @@ def load_model(m=None, d=None):
     mujoco.set_mjcb_control(None)
     m.opt.timestep = dt_sim
 
-    wave_pad = WavePadMotion(body_name="wave_pad", trans_vel=(0.4, 0.0))
+    wave_pad = WavePadMotion(body_name="wave_pad", trans_vel=(0.3, 0.0))
     wave_pad.bind_model(m, d)
     return m, d, wave_pad
 
@@ -48,9 +50,19 @@ CAMERA_MATRIX = np.array([
 DIST_COEFFS = np.zeros(4, dtype=np.float32)   # 假设使用 k1,k2,p1,p2 模型
 
 
+P_cam_in_body = torch.tensor([0.0, 0.0, -0.05], dtype=torch.float32)
+# R_cam_to_body = torch.tensor([  # TODO
+#     [0, 1, 0],
+#     [-1, 0, 0],
+#     [0, 0, -1]
+# ], dtype=torch.float32)   # 绕 x 轴转 180°
+R_cam_to_body = torch.eye(3)        # from mujoco
+control_pos_error = torch.Tensor([0.0, 0.0, 2.0])
+
+
 log_count = 0
-def cv_apriltag(raw_image_):
-    global log_count
+def cv_apriltag(raw_image_, m, d):
+    global log_count, control_pos_error, tag_detected
     rgb_drone_camera = cv2.cvtColor(cv2.flip(raw_image_, 0), cv2.COLOR_RGB2BGR)
     gray_image = cv2.cvtColor(rgb_drone_camera, cv2.COLOR_BGR2GRAY)
     tags = detector.detect(gray_image)
@@ -67,17 +79,48 @@ def cv_apriltag(raw_image_):
                 flags=cv2.SOLVEPNP_ITERATIVE
             )
             if success:
+                tag_detected = True
                 cv2.drawFrameAxes(rgb_drone_camera, CAMERA_MATRIX, DIST_COEFFS, rvec, tvec, 0.1)
 
-                log_count += 1
-                if log_count >= 50:
-                    log_count = 0
-                    print(f"rvec: {rvec}\n tvec: {tvec}\n")
-                    pass
+                # calculate pos error
+                P_tag_in_cam = torch.from_numpy(tvec.ravel()).float()
+                P_tag_in_body = R_cam_to_body @ P_tag_in_cam + P_cam_in_body
+
+                _sensor = torch.from_numpy(d.sensordata).float()
+                quat  = _sensor[6:10]         # [w, x, y, z]
+                R_body_to_world = rotation_matrix(
+                    quat[0].item(), quat[1].item(), quat[2].item(), quat[3].item()
+                ).float()
+                P_tag_from_body_W = R_body_to_world @ P_tag_in_body
+
+                P_des_body_from_pad_W = torch.tensor([0.0, 0.0, 0.5], dtype=torch.float32)
+                P_body_from_tag_W = -P_tag_from_body_W
+                control_pos_error = P_des_body_from_pad_W - (P_body_from_tag_W)
+
+# 获取真实的世界位置
+                body_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, 'cf2')
+                pad_id  = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, 'wave_pad')
+                p_body_true = d.xpos[body_id]   # 机体世界位置
+                p_pad_true  = d.xpos[pad_id]    # 标签世界位置 (假设 pad 中心就是标签)
+                P_body_from_tag_true = p_body_true - p_pad_true   # numpy数组
+
+                print(f"真实 P_body_from_tag: {P_body_from_tag_true}")
+                print(f"计算 P_body_from_tag_W: {P_body_from_tag_W.numpy()}")
+                print(f"真实高度差: {P_body_from_tag_true[2]}")
+
+                print(f"P_des_body_from_pad_W: {P_des_body_from_pad_W} | P_body_from_tag_W: {P_body_from_tag_W} | error: {control_pos_error}")
+            else:
+                tag_detected = False
+
+            log_count += 1
+            if log_count >= 50:
+                log_count = 0
+                print(f"rvec: {rvec}\n tvec: {tvec}\n")
+                pass
 
 
-    # cv2.imshow("Drone Camera 1920x1080", rgb_drone_camera)    # bug
-    # cv2.waitKey(1)
+    cv2.imshow("Drone Camera 1920x1080", rgb_drone_camera)    # bug
+    cv2.waitKey(1)
 
 
 
@@ -131,7 +174,8 @@ if __name__ == '__main__':
         mujoco.mjr_render(full_viewport, scene, context)
         mujoco.mjr_readPixels(full_rgb, full_depth, full_viewport, context)
 
-        cv_apriltag(full_rgb)
+        global ctrl_pos_error, tag_detected
+        cv_apriltag(full_rgb, model, data)
 
         # update and render main_viewport
         mujoco.mjv_updateScene(model, data, opt, None, cam,
@@ -157,7 +201,7 @@ if __name__ == '__main__':
 
         # 控制周期到了，执行控制
         # 实际 data.time 是物理时间，控制依赖物理时间
-        control_callback(model, data)
+        control_callback(model, data, control_pos_error)
 
     cv2.destroyAllWindows()
     glfw.terminate()
