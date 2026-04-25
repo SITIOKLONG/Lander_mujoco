@@ -16,6 +16,7 @@ dt_sim = 0.01
 decimation = 2
 dt_control = dt_sim * decimation
 
+
 def load_model(m=None, d=None):
     mujoco.set_mjcb_control(None)
     m = mujoco.MjModel.from_xml_path("./crazyfile/scene.xml")
@@ -23,7 +24,7 @@ def load_model(m=None, d=None):
     mujoco.set_mjcb_control(None)
     m.opt.timestep = dt_sim
 
-    wave_pad = WavePadMotion(body_name="wave_pad")
+    wave_pad = WavePadMotion(body_name="wave_pad", trans_vel=(0.4, 0.0))
     wave_pad.bind_model(m, d)
     return m, d, wave_pad
 
@@ -37,6 +38,7 @@ object_points = np.array([
     [half_s, -half_s, 0],
     [-half_s, -half_s, 0],
 ], dtype=np.float32)
+# 1920*1080 120fov
 CAMERA_MATRIX = np.array([
     [554.26, 0, 960],
     [0, 554.26, 540],
@@ -96,8 +98,8 @@ if __name__ == '__main__':
     context = mujoco.MjrContext(model, mujoco.mjtFontScale.mjFONTSCALE_150.value)
 
     opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = True
-    # opt.flags[mujoco.mjtVisFlag.mjVIS_CAMERA] = True
     opt.frame = mujoco.mjtFrame.mjFRAME_BODY
+    # opt.flags[mujoco.mjtVisFlag.mjVIS_CAMERA] = True
 
     # 设置默认相机参数( tracking drone )
     cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING

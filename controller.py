@@ -77,7 +77,7 @@ def control_callback(m, d):
     # 构建当前状态
     # current_state = torch.tensor([_pos[0], _pos[1], _pos[2], quat[0], quat[1], quat[2], quat[3], _vel[0], _vel[1], _vel[2], omega[0], omega[1], omega[2]])
     # 位置控制模式 目标位点
-    goal_position = torch.tensor([0.0, 0.0, 0.5])
+    goal_position = torch.tensor([0.0, 0.0, 2.0])
 
     Kp_pos = 5.0   # 位置环比例增益，后面可调
     v_des = Kp_pos * (goal_position - _pos[:3])     # TODO pos

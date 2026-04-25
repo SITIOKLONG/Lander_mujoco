@@ -13,16 +13,17 @@ class WavePadMotion:
     def __init__(
         self,
         body_name="wave_pad",
-        amp_heave=0.1,
+        amp_heave=0.3,
         amp_roll_deg=30.0,
         amp_pitch_deg=30.0,
         freq_min=0.05,
-        freq_max=0.1,
+        freq_max=0.15,
         n_sines=6,
         ou_rho=0.99,
         ou_sigma=0.05,
-        smoother_alpha=0.01,
+        smoother_alpha=0.02,
         seed=7,
+        trans_vel=(0.0, 0.0)
     ):
         self.body_name = body_name
         self.amp_heave = float(amp_heave)
@@ -53,6 +54,9 @@ class WavePadMotion:
         self.prev_quat = None
         self.current_lin_vel = np.zeros(3, dtype=np.float64)
         self.current_ang_vel = np.zeros(3, dtype=np.float64)
+
+        self.trans_vel = np.array(trans_vel, dtype=np.float64)   # 固定速度向量
+        self.translation = np.zeros(2, dtype=np.float64)         # 累積的水平位移 (x, y)
 
     def bind_model(self, m, d):
         body_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, self.body_name)
@@ -92,6 +96,7 @@ class WavePadMotion:
 
     def reset(self, d, resample=True):
         self.t = 0.0
+        self.translation[:] = 0.0
         self.ou_state[:] = 0.0
         self.smooth_state[:] = 0.0
         if resample or self.omegas is None:
@@ -125,8 +130,15 @@ class WavePadMotion:
         prev_pos = d.mocap_pos[self.mocap_id].copy()
         prev_quat = d.mocap_quat[self.mocap_id].copy()
 
-        d.mocap_pos[self.mocap_id] = self.base_pos
-        d.mocap_pos[self.mocap_id, 2] = self.base_pos[2] + z_offset
+        # 更新累積的平移量 
+        self.translation += self.trans_vel * self.dt
+
+        # 計算新位置：base_pos + 水平平移 + 垂直波浪偏移
+        new_pos = self.base_pos.copy()
+        new_pos[0] += self.translation[0]
+        new_pos[1] += self.translation[1]
+        new_pos[2] = self.base_pos[2] + z_offset
+        d.mocap_pos[self.mocap_id] = new_pos
 
         dq = euler_xyz_to_quat_wxyz(roll, pitch, 0.0)
         d.mocap_quat[self.mocap_id] = quat_multiply(self.base_quat, dq)
