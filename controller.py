@@ -33,7 +33,7 @@ def calc_motor_input(krpm):
     return inp
 
 
-def control_callback(m, d, control_pos_error):
+def control_callback(m, d, P_body_from_tag_w, control_action):
     global log_count
 
     # ---- 步骤 1：从仿真器读取数据，全部转为 torch.Tensor ----
@@ -54,11 +54,12 @@ def control_callback(m, d, control_pos_error):
     ).float()
 
     # ---- 步骤 2：位置 + 速度 + 加速度期望 ----
-    # goal_position = torch.tensor([0.0, 0.0, 2.0])     # debug test
-    Kp_pos = torch.Tensor([2.0, 2.0, 4.0])  # 可分别调节 XY 和 Z
-    v_des = Kp_pos * control_pos_error               # 期望速度
+    goal_position = torch.tensor([0.0, 0.0])     # debug test
+    Kp_pos = torch.tensor([2.0, 2.0])  # only use position control for XY
+    v_des = torch.cat([Kp_pos * (goal_position - P_body_from_tag_w.view(-1)[:2]), control_action.view(-1)])                # 期望速度
+    print(f"v_des: {v_des} | v_real: {P_body_from_tag_w}")
 
-    Kv_p = torch.Tensor([2.5, 2.5, 4.0])     # 阻尼增益
+    Kv_p = torch.tensor([4.0, 4.0, 10.0])     # 阻尼增益
     a_des = Kv_p * (v_des - _vel[:3]) + torch.tensor([0.0, 0.0, g0])
 
     # ---- 步骤 3：根据期望加速度计算期望姿态 ----
@@ -89,7 +90,7 @@ def control_callback(m, d, control_pos_error):
     e_R[2] = 0.0
 
     # ---- 步骤 4：角速度 + 力矩控制 ----
-    Kp_att = 10.0
+    Kp_att = 8.0
     omega_des = -Kp_att * e_R
 
     Kd_rate = 0.001

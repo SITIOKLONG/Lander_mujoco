@@ -66,7 +66,7 @@
   </asset>
 
   <worldbody>
-    <body name="cf2" pos="1.0 1.0 1.0" childclass="cf2">
+    <body name="cf2" pos="1.0 1.0 2.0" childclass="cf2">
       <freejoint />
       <inertial pos="0 0 0" mass="0.033" diaginertia="1.395e-5 1.395e-5 2.173e-5" />
       <camera name="drone_camera" pos="0 0 -0.01" xyaxes="1 0 0 0 1 0" fovy="120" />
@@ -116,14 +116,18 @@
       <site name="motor3_site" pos="-0.0325 -0.0325 0.013" />
       <site name="motor4_site" pos="-0.0325 0.0325 0.013" />
       
-     <geom name="landing_gear_1" type="cylinder" pos="0.05 0.05 -0.03" size="0.004 0.03"
-        material="body_frame_plastic" class="visual" contype="1" conaffinity="1" />
-      <geom name="landing_gear_2" type="cylinder" pos="0.05 -0.05 -0.03" size="0.004 0.03"
-        material="body_frame_plastic" class="visual" contype="1" conaffinity="1" />
-      <geom name="landing_gear_3" type="cylinder" pos="-0.05 -0.05 -0.03" size="0.004 0.03"
-        material="body_frame_plastic" class="visual" contype="1" conaffinity="1" />
-      <geom name="landing_gear_4" type="cylinder" pos="-0.05 0.05 -0.03" size="0.004 0.03"
-        material="body_frame_plastic" class="visual" contype="1" conaffinity="1" />
+<geom name="landing_gear_1" type="cylinder" pos="0.05 0.05 -0.03" size="0.004 0.03"
+      material="body_frame_plastic" class="visual" contype="1" conaffinity="1"
+      friction="3.0 0.1 0.005" />
+<geom name="landing_gear_2" type="cylinder" pos="0.05 -0.05 -0.03" size="0.004 0.03"
+      material="body_frame_plastic" class="visual" contype="1" conaffinity="1"
+      friction="3.0 0.1 0.005" />
+<geom name="landing_gear_3" type="cylinder" pos="-0.05 -0.05 -0.03" size="0.004 0.03"
+      material="body_frame_plastic" class="visual" contype="1" conaffinity="1"
+      friction="3.0 0.1 0.005" />
+<geom name="landing_gear_4" type="cylinder" pos="-0.05 0.05 -0.03" size="0.004 0.03"
+      material="body_frame_plastic" class="visual" contype="1" conaffinity="1"
+      friction="3.0 0.1 0.005" />
 
     </body>
   </worldbody>

@@ -15,9 +15,19 @@ from utils_math import *
 
 # 100Hz 10ms 0.01s
 dt_sim = 0.01
+# dt_sim = 1/120
 decimation = 2
 dt_control = dt_sim * decimation
 
+
+policy = torch.jit.load("./policy/policy_3.pt")
+policy.eval()
+device = torch.device("mps")
+
+# 设定阈值 (米)
+xy_threshold = 0.3
+# 基础期望（不启用策略时的默认值）
+default_height = 1.0
 
 def load_model(m=None, d=None):
     mujoco.set_mjcb_control(None)
@@ -29,6 +39,18 @@ def load_model(m=None, d=None):
     wave_pad = WavePadMotion(body_name="wave_pad", trans_vel=(0.3, 0.0))
     wave_pad.bind_model(m, d)
     return m, d, wave_pad
+
+def check_contact(data, body1_id, body2_id):
+    """检查两个 body 是否接触（通过 body id）"""
+    for i in range(data.ncon):
+        con = data.contact[i]
+        # 接触的 geom 属于哪个 body
+        geom1_body = model.geom_bodyid[con.geom1]
+        geom2_body = model.geom_bodyid[con.geom2]
+        if (geom1_body == body1_id and geom2_body == body2_id) or \
+           (geom1_body == body2_id and geom2_body == body1_id):
+            return True
+    return False
 
 # cv apriltag
 detector = Detector(families="tag36h11", nthreads=1, quad_decimate=1.0, refine_edges=1)
@@ -56,15 +78,17 @@ R_cam_to_body = torch.tensor([  # TODO
     [0, -1, 0],
     [0, 0, -1]
 ], dtype=torch.float32)
-control_pos_error = torch.Tensor([0.0, 0.0, 2.0])
-
+control_action = torch.zeros(1,1)
+P_body_from_tag_w = torch.zeros(1,3)
 
 log_count = 0
-pad_quat_prev = torch.Tensor([1,0,0,0])
-filtered_pad_ang_vel_w = torch.Tensor([0,0,])
-first_apriltag_detected = False
+# pad_quat_prev = torch.tensor([1,0,0,0])
+# filtered_pad_ang_vel_w = torch.tensor([0,0,])
+# first_apriltag_detected = False
+reached_count = 0
+higher_error_count = 0
 def cv_apriltag(raw_image_, m, d):
-    global log_count, control_pos_error, tag_detected, pad_quat_prev, first_apriltag_detected, filtered_pad_ang_vel_w
+    global log_count, control_action, tag_detected, policy, device, reached_count, P_body_from_tag_w
     rgb_drone_camera = cv2.cvtColor(cv2.flip(raw_image_, 0), cv2.COLOR_RGB2BGR)
     gray_image = cv2.cvtColor(rgb_drone_camera, cv2.COLOR_BGR2GRAY)
     tags = detector.detect(gray_image)
@@ -89,6 +113,7 @@ def cv_apriltag(raw_image_, m, d):
                 P_tag_in_body = R_cam_to_body @ P_tag_in_cam + P_cam_in_body
                 # print(f"P_tag_in_body: {P_tag_in_body}")
 
+
                 _sensor = torch.from_numpy(d.sensordata).float()
                 quat  = _sensor[6:10]         # [w, x, y, z]
                 R_body_to_world = rotation_matrix(
@@ -97,45 +122,49 @@ def cv_apriltag(raw_image_, m, d):
                 P_tag_from_body_w = R_body_to_world @ P_tag_in_body
                 # print(f"P_tag_from_body_w: {P_tag_from_body_w}")
 
-                P_des_body_from_pad_w = torch.tensor([0.0, 0.0, 1.5], dtype=torch.float32)
+                P_des_body_from_pad_w = torch.tensor([0.0, 0.0, 0.5], dtype=torch.float32)
                 P_body_from_tag_w = -P_tag_from_body_w
-                control_pos_error = P_des_body_from_pad_w - (P_body_from_tag_w)
-
-# 获取真实的世界位置
-                # body_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, 'cf2')
-                # pad_id  = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, 'wave_pad')
-                # p_body_true = d.xpos[body_id]   # 机体世界位置
-                # p_pad_true  = d.xpos[pad_id]    # 标签世界位置 (假设 pad 中心就是标签)
-                # P_body_from_tag_true = p_body_true - p_pad_true   # numpy数组
-                #
-                # print(f"真实 P_body_from_tag: {P_body_from_tag_true}")
-                # print(f"计算 P_body_from_tag_w: {P_body_from_tag_w.numpy()}")
-                # print(f"真实高度差: {P_body_from_tag_true[2]}")
-                #
-                # print(f"P_des_body_from_pad_w: {P_des_body_from_pad_w} | P_body_from_tag_w: {P_body_from_tag_w} | error: {control_pos_error}")
 
 
                 # get pad quat for nn model obs
                 R_tag_to_cam, _ = cv2.Rodrigues(rvec)
                 R_tag_to_cam = torch.from_numpy(R_tag_to_cam).float()   # 转 torch 张量方便后续运算
                 R_tag_to_world = R_body_to_world @ R_cam_to_body @ R_tag_to_cam
-                pad_quat = rotation_matrix_to_quat_wxyz(R_tag_to_world)
-                pad_ang_vel_w = quat_to_ang_vel_wxyz(pad_quat_prev, pad_quat, dt_sim)
-                if first_apriltag_detected is False:
-                    filtered_pad_ang_vel_w = pad_ang_vel_w
-                filtered_pad_ang_vel_w = 0.9 * filtered_pad_ang_vel_w + 0.1 * pad_ang_vel_w
+                pitch = torch.asin(torch.clamp(-R_tag_to_world[2, 0], -1.0, 1.0))
+                roll  = torch.atan2(R_tag_to_world[2, 1], R_tag_to_world[2, 2])
+                # pad_quat = rotation_matrix_to_quat_wxyz(R_tag_to_world)
+                # pad_ang_vel_w = quat_to_ang_vel_wxyz(pad_quat_prev, pad_quat, dt_sim)
+                # if first_apriltag_detected is False:
+                #     filtered_pad_ang_vel_w = pad_ang_vel_w
+                # filtered_pad_ang_vel_w = 0.99 * filtered_pad_ang_vel_w + 0.01 * pad_ang_vel_w
 
-                print(f"pad_quat: {pad_quat} | pad_quat_last: {pad_quat_prev} | pad_ang_vel_w: {filtered_pad_ang_vel_w}")
-                pad_quat_prev = pad_quat
-                first_apriltag_detected = True
-            else:
-                tag_detected = False
+                # print(f"pad_quat: {pad_quat} | pad_quat_last: {pad_quat_prev} | pad_ang_vel_w: {filtered_pad_ang_vel_w}")
+                # pad_quat_prev = pad_quat
+                # first_apriltag_detected = True
+
+                # print(f"obs: {obs} | action: {action}")
+
+                xy_error = torch.norm(P_body_from_tag_w[:2])   # P_body_from_tag_w 是 [x, y, z]
+                if xy_error < xy_threshold:
+                    reached_count += 1
+                    if reached_count >= 100:   # 0.02 * 100 = 2sec
+                        obs = torch.cat([P_body_from_tag_w[2].reshape(1), roll.reshape(1), pitch.reshape(1)]).unsqueeze(0)  # (1, 5)
+                        # print(f"obs: {obs}")
+                        control_action = 0.2 * policy(obs)  # action scale 0.2
+                        # print(f"control_action: {control_action}")
+                else:
+                    reached_count = 0
+                    control_action = torch.zeros(1,1)
+
 
             log_count += 1
             if log_count >= 50:
                 log_count = 0
                 print(f"rvec: {rvec}\n tvec: {tvec}\n")
                 pass
+    else:
+        tag_detected = False
+
 
 
     # cv2.imshow("Drone Camera 1920x1080", rgb_drone_camera)    # bug
@@ -183,6 +212,9 @@ if __name__ == '__main__':
     full_rgb = np.zeros((full_height, full_width, 3), dtype=np.uint8)
     full_depth = np.zeros((full_height, full_width), dtype=np.float32)
 
+    cf2_body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, 'cf2')
+    wave_pad_body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, 'wave_pad')
+
     # main loop
     while not glfw.window_should_close(window):
         # get main viewport
@@ -218,9 +250,15 @@ if __name__ == '__main__':
             wave_pad.step(data)
             mujoco.mj_step(model, data)
 
-        # 控制周期到了，执行控制
-        # 实际 data.time 是物理时间，控制依赖物理时间
-        control_callback(model, data, control_pos_error)
+        # 控制周期
+        if check_contact(data, cf2_body, wave_pad_body):
+            # 所有电机 ctrl 置零
+            data.actuator('motor1').ctrl[0] = 0
+            data.actuator('motor2').ctrl[0] = 0
+            data.actuator('motor3').ctrl[0] = 0
+            data.actuator('motor4').ctrl[0] = 0
+        else:
+            control_callback(model, data, P_body_from_tag_w, control_action)
 
     cv2.destroyAllWindows()
     glfw.terminate()

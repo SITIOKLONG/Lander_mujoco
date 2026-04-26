@@ -13,7 +13,7 @@ class WavePadMotion:
     def __init__(
         self,
         body_name="wave_pad",
-        amp_heave=0.3,
+        amp_heave=0.0,
         amp_roll_deg=30.0,
         amp_pitch_deg=30.0,
         freq_min=0.05,
