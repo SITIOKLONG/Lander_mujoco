@@ -12,29 +12,15 @@ max_thrust = 0.1573
 
 log_count = 0
 
+p_xy_integral = torch.zeros(2)      # 位置误差积分（XY）
+v_integral = torch.zeros(3)     # 速度误差积分（XYZ）
 
-def attitude_error_quat(q_curr_: torch.Tensor, q_des_: torch.Tensor) -> torch.Tensor:
-    if torch.dot(q_curr_, q_des_) < 0:
-        q_des_ = -q_des_
-    q_des_inv = quat_inverse(q_des_)
-    q_error = quat_multiply(q_des_inv, q_curr_)
-    return 2.0 * q_error[1:]
+# 积分限幅，防止 windup
+MAX_POS_INT = 0.5
+MAX_VEL_INT = 0.2
 
-
-def calc_motor_force(krpm):
-    return Ct * krpm ** 2
-
-
-def calc_motor_input(krpm):
-    krpm = torch.clamp(krpm, 0, 22)
-    force = calc_motor_force(krpm)
-    inp = force / max_thrust
-    inp = torch.clamp(inp, 0, 1)
-    return inp
-
-
-def control_callback(m, d, P_body_from_tag_w, control_action):
-    global log_count
+def control_callback(m, d, dt, P_body_from_tag_w, control_action):
+    global log_count, p_xy_integral, MAX_POS_INT, v_integral, MAX_VEL_INT
 
     # ---- 步骤 1：从仿真器读取数据，全部转为 torch.Tensor ----
     _pos   = torch.from_numpy(d.qpos).float()
@@ -54,17 +40,25 @@ def control_callback(m, d, P_body_from_tag_w, control_action):
     ).float()
 
     # ---- 步骤 2：位置 + 速度 + 加速度期望 ----
-    goal_position = torch.tensor([0.0, 0.0])     # debug test
     Kp_pos = torch.tensor([2.0, 2.0])  # only use position control for XY
-    v_des = torch.cat([Kp_pos * (goal_position - P_body_from_tag_w.view(-1)[:2]), control_action.view(-1)])                # 期望速度
-    print(f"v_des: {v_des} | v_real: {P_body_from_tag_w}")
+    Ki_pos = torch.tensor([0.1, 0.1])
+    p_error_xy = torch.tensor([0.0, 0.0]) - P_body_from_tag_w.view(-1)[:2]
+    p_xy_integral += p_error_xy * dt
+    integral_p_xy = torch.clamp(p_xy_integral, -MAX_POS_INT, MAX_POS_INT)
+    v_des = torch.cat([Kp_pos * p_error_xy + Ki_pos * integral_p_xy, control_action.view(-1)])                # 期望速度
+    # v_des = torch.cat([Kp_pos * p_error_xy + Ki_pos * integral_p_xy, torch.tensor([-0.05])])                # 期望速度
+    print(f"v_des: {v_des[2]:2f} | v_real: {_vel[2]:2f}")
 
-    Kv_p = torch.tensor([4.0, 4.0, 10.0])     # 阻尼增益
-    a_des = Kv_p * (v_des - _vel[:3]) + torch.tensor([0.0, 0.0, g0])
+    Kp_vel = torch.tensor([4.0, 4.0, 20.0])     # 阻尼增益
+    Ki_vel = torch.tensor([0,0,2])
+    v_error = v_des - _vel[:3]
+    v_integral += v_error * dt
+    v_integral = torch.clamp(v_integral, -MAX_VEL_INT, MAX_VEL_INT)
+    a_des = Kp_vel * v_error + Ki_vel * v_integral+ torch.tensor([0.0, 0.0, g0])
 
     # ---- 步骤 3：根据期望加速度计算期望姿态 ----
     z_curr = R_body_to_world[:, 2]          # 世界系下当前机体 Z 轴
-    z_des  = a_des / torch.norm(a_des)      # 期望推力方向（单位向量）
+    z_des = a_des / torch.norm(a_des)      # 期望推力方向（单位向量）
 
     axis = torch.linalg.cross(z_curr, z_des)
     axis_norm = torch.norm(axis)
@@ -125,3 +119,25 @@ def control_callback(m, d, P_body_from_tag_w, control_action):
     log_count += 1
     if log_count >= 50:
         log_count = 0
+
+
+def attitude_error_quat(q_curr_: torch.Tensor, q_des_: torch.Tensor) -> torch.Tensor:
+    if torch.dot(q_curr_, q_des_) < 0:
+        q_des_ = -q_des_
+    q_des_inv = quat_inverse(q_des_)
+    q_error = quat_multiply(q_des_inv, q_curr_)
+    return 2.0 * q_error[1:]
+
+
+def calc_motor_force(krpm):
+    return Ct * krpm ** 2
+
+
+def calc_motor_input(krpm):
+    krpm = torch.clamp(krpm, 0, 22)
+    force = calc_motor_force(krpm)
+    inp = force / max_thrust
+    inp = torch.clamp(inp, 0, 1)
+    return inp
+
+

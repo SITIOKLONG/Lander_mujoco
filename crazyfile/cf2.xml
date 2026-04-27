@@ -118,16 +118,16 @@
       
 <geom name="landing_gear_1" type="cylinder" pos="0.05 0.05 -0.03" size="0.004 0.03"
       material="body_frame_plastic" class="visual" contype="1" conaffinity="1"
-      friction="3.0 0.1 0.005" />
+      friction="10.0 0.1 0.005" />
 <geom name="landing_gear_2" type="cylinder" pos="0.05 -0.05 -0.03" size="0.004 0.03"
       material="body_frame_plastic" class="visual" contype="1" conaffinity="1"
-      friction="3.0 0.1 0.005" />
+      friction="10.0 0.1 0.005" />
 <geom name="landing_gear_3" type="cylinder" pos="-0.05 -0.05 -0.03" size="0.004 0.03"
       material="body_frame_plastic" class="visual" contype="1" conaffinity="1"
-      friction="3.0 0.1 0.005" />
+      friction="10.0 0.1 0.005" />
 <geom name="landing_gear_4" type="cylinder" pos="-0.05 0.05 -0.03" size="0.004 0.03"
       material="body_frame_plastic" class="visual" contype="1" conaffinity="1"
-      friction="3.0 0.1 0.005" />
+      friction="10.0 0.1 0.005" />
 
     </body>
   </worldbody>

@@ -36,7 +36,7 @@ def load_model(m=None, d=None):
     mujoco.set_mjcb_control(None)
     m.opt.timestep = dt_sim
 
-    wave_pad = WavePadMotion(body_name="wave_pad", trans_vel=(0.3, 0.0))
+    wave_pad = WavePadMotion(body_name="wave_pad", trans_vel=(0.2, 0.2))
     wave_pad.bind_model(m, d)
     return m, d, wave_pad
 
@@ -258,7 +258,7 @@ if __name__ == '__main__':
             data.actuator('motor3').ctrl[0] = 0
             data.actuator('motor4').ctrl[0] = 0
         else:
-            control_callback(model, data, P_body_from_tag_w, control_action)
+            control_callback(model, data, dt_control, P_body_from_tag_w, control_action)
 
     cv2.destroyAllWindows()
     glfw.terminate()
