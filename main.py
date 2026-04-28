@@ -1,142 +1,63 @@
-from src.math_utils import quaternion_to_R, rot_to_rpy_zxy
-import numpy as np
-import cvxpy as cp
+import mujoco
+from mujoco.glfw import glfw
 import cv2
 from cv2 import solvePnP
-import glfw
-import mujoco
-import mujoco.viewer
+import numpy as np
 from pupil_apriltags import Detector
+import torch
+import collections
 
 import os
-os.environ["MUJOCO_GL"] = "egl"
+os.environ["MUJOCO_GL"] = "glfw"
+
+from controller import control_callback
+from pad import WavePadMotion
+from utils_math import *
+
+# 100Hz 10ms 0.01s
+dt_sim = 0.01
+# dt_sim = 1/120
+decimation = 2
+dt_control = dt_sim * decimation
 
 
-# params
-dt_sim = 1/120
-control_decimation = 2
-dt_control = control_decimation * dt_sim
-control_step = 0
+policy = torch.jit.load("./policy/policy_7.pt")
+policy.eval()
+device = torch.device("mps")
+obs_buffer = collections.deque(maxlen=3)
+for _ in range(3):
+    obs_buffer.append(torch.zeros(3))
 
-# drone params
-g0 = 9.8066
-mq = 33e-3
-Ixx = 1.395e-5
-Iyy = 1.395e-5
-Izz = 2.173e-5
-Cd = 7.9379e-06
-Ct = 3.25e-4
-dq = 65e-3
-l = dq/2
+# 设定阈值 (米)
+xy_threshold = 0.3
+# 基础期望（不启用策略时的默认值）
+default_height = 1.0
 
-A = np.eye(6)
-A[0, 3] = A[1, 4] = A[2, 5] = dt_control
+def load_model(m=None, d=None):
+    mujoco.set_mjcb_control(None)
+    m = mujoco.MjModel.from_xml_path("./crazyfile/scene.xml")
+    d = mujoco.MjData(m)
+    mujoco.set_mjcb_control(None)
+    m.opt.timestep = dt_sim
 
-B = np.zeros((6, 3))    # u = [angle_x, angle_y, acceleration_z]
-B[3, 0] = g0 * dt_control
-B[4, 1] = g0 * dt_control
-B[5, 2] = dt_control
-B[0, 0] = 0.5 * g0 * dt_control**2
-B[1, 1] = 0.5 * g0 * dt_control**2
-B[2, 2] = 0.5 * dt_control**2
+    wave_pad = WavePadMotion(body_name="wave_pad", trans_vel=(0.2, 0.2))
+    wave_pad.bind_model(m, d)
+    return m, d, wave_pad
 
-# state: [px, py, pz, vx, vy, vz]
-Q = np.diag([10, 10, 200, 20.0, 20.0, 50.0])
-# control: [roll_cmd, pitch_cmd, accel_z_cmd]
-R = np.diag([0.5, 0.5, 0.05])
+def check_contact(data, body1_id, body2_id):
+    """检查两个 body 是否接触（通过 body id）"""
+    for i in range(data.ncon):
+        con = data.contact[i]
+        # 接触的 geom 属于哪个 body
+        geom1_body = model.geom_bodyid[con.geom1]
+        geom2_body = model.geom_bodyid[con.geom2]
+        if (geom1_body == body1_id and geom2_body == body2_id) or \
+           (geom1_body == body2_id and geom2_body == body1_id):
+            return True
+    return False
 
-# mixer gain
-Kp_roll = 0.005
-Kd_roll = 0.00011
-Kp_pitch = 0.005
-Kd_pitch = 0.00011
-Kp_yaw = 0.005
-Kd_yaw = 0.00011
-
-
-def build_B(psi, dt, g):
-    c = np.cos(psi)
-    s = np.sin(psi)
-    B = np.zeros((6, 3))
-
-    B[0, 0] = 0.5 * g * dt**2 * c
-    B[0, 1] = 0.5 * g * dt**2 * s
-    B[1, 0] = 0.5 * g * dt**2 * s
-    B[1, 1] = -0.5 * g * dt**2 * c
-    B[2, 2] = 0.5 * dt**2
-
-    B[3, 0] = g * dt * c
-    B[3, 1] = g * dt * s
-    B[4, 0] = g * dt * s
-    B[4, 1] = -g * dt * c
-    B[5, 2] = dt
-    return B
-
-
-def solve_mpc(state, target_height, Q, R, A, B, dt, N=50):
-    u = cp.Variable((3, N))     # control: pitch, roll, thrust
-    x = cp.Variable((6, N + 1))     # state: [pos, vel]
-
-    goal = np.array([0, 0, target_height, 0, 0, 0])
-
-    cost = 0
-    constraints = [x[:, 0] == state]
-
-    for t in range(N):
-        cost += cp.quad_form(x[:, t] - goal, Q)
-        cost += cp.quad_form(u[:, t], R)
-
-        # dynamics
-        constraints += [x[:, t+1] == A @ x[:, t] + B @ u[:, t]]
-
-        # print("A: ", A, "B: ", B)
-
-        # physical
-        constraints += [u[0, t] <= 0.3, u[0, t] >= - 0.3]  # roll angle
-        constraints += [u[1, t] <= 0.3, u[1, t] >= - 0.3]  # pitch angle
-        constraints += [u[2, t] <= 5.0, u[2, t] >= - 2.0]  # accele_z
-
-    prob = cp.Problem(cp.Minimize(cost), constraints)
-    prob.solve(solver=cp.OSQP, verbose=False)
-    # if prob.status not in ["optimal", "optimal_inaccurate"]:
-    #     print("MPC not optimal", prob.status)
-    #     return np.zeros(3)  # last
-
-    # print("prob: ", prob.status)
-
-    return u[:, 0].value
-
-
-# openGL drone track camera
-resolution = (1920, 1080)
-glfw.init()
-glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
-window = glfw.create_window(
-    resolution[0], resolution[1], "Offscreen", None, None)
-glfw.make_context_current(window)
-
-# MuJoCo setup
-model = mujoco.MjModel.from_xml_path("./crazyfile/scene.xml")
-data = mujoco.MjData(model)
-scene = mujoco.MjvScene(model, maxgeom=10000)
-context = mujoco.MjrContext(model, mujoco.mjtFontScale.mjFONTSCALE_150.value)
-
-# set camera
-camera_name = "track"
-camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
-camera = mujoco.MjvCamera()
-camera.type = mujoco.mjtCamera.mjCAMERA_FIXED
-if camera_id != -1:
-    print("camera_id", camera_id)
-    camera.fixedcamid = camera_id
-
-# frame buffer
-frambuffer = mujoco.MjrRect(0, 0, resolution[0], resolution[1])
-mujoco.mjr_setBuffer(mujoco.mjtFramebuffer.mjFB_OFFSCREEN, context)
-
-# april tag
-detector = Detector(families="tag36h11", nthreads=1, quad_decimate=1.0,
-                    refine_edges=1)
+# cv apriltag
+detector = Detector(families="tag36h11", nthreads=1, quad_decimate=1.0, refine_edges=1)
 TAG_SIZE = 0.1
 half_s = TAG_SIZE / 2
 object_points = np.array([
@@ -145,141 +66,215 @@ object_points = np.array([
     [half_s, -half_s, 0],
     [-half_s, -half_s, 0],
 ], dtype=np.float32)
+# 1920*1080 120fov
 CAMERA_MATRIX = np.array([
     [554.26, 0, 960],
     [0, 554.26, 540],
     [0, 0, 1]
 ], dtype=np.float32)
-DIST_COEFFS = np.zeros((5, 1), dtype=np.float32)
+# DIST_COEFFS = np.array((5, 1), dtype=np.float32)
+DIST_COEFFS = np.zeros(4, dtype=np.float32)   # 假设使用 k1,k2,p1,p2 模型
 
-# setup params
-last_pos_rel = None
-vel_rel = np.zeros(3)
-last_u_cmd = np.array([0.0, 0.0, 0.0])
-with mujoco.viewer.launch_passive(model, data) as viewer:
-    while viewer.is_running():
-        mujoco.mj_step(model, data)
-        control_step += 1
-        # print("control_step: ", control_step)
-        viewer.sync()
 
-        if control_step % control_decimation == 0:
-            # track camera cv2
-            viewport = mujoco.MjrRect(0, 0, resolution[0], resolution[1])
-            mujoco.mjv_updateScene(model, data, mujoco.MjvOption(
-            ), mujoco.MjvPerturb(), camera, mujoco.mjtCatBit.mjCAT_ALL, scene)
-            mujoco.mjr_render(viewport, scene, context)
-            rgb = np.zeros((resolution[1], resolution[0], 3), dtype=np.uint8)
-            mujoco.mjr_readPixels(rgb, None, viewport, context)
-            bgr = cv2.cvtColor(np.flipud(rgb), cv2.COLOR_RGB2BGR)
+P_cam_in_body = torch.tensor([0.0, 0.0, -0.05], dtype=torch.float32)
+R_cam_to_body = torch.tensor([  # TODO
+    [1, 0, 0],
+    [0, -1, 0],
+    [0, 0, -1]
+], dtype=torch.float32)
+control_action = torch.zeros(1,1)
+P_body_from_tag_w = torch.zeros(1,3)
 
-            # detector apriltag
-            gray_image = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-            tags = detector.detect(gray_image)
-            if len(tags) > 0:
-                for tag in tags:
-                    # print(f"detected tag ID: {tag.tag_id}")
-                    img_points = np.array(tag.corners, dtype=np.float32)
-                    success, rvec, tvec = solvePnP(
-                        object_points,
-                        img_points,
-                        CAMERA_MATRIX,
-                        DIST_COEFFS,
-                        flags=cv2.SOLVEPNP_ITERATIVE
-                    )
-                    if success:
-                        cv2.drawFrameAxes(bgr, CAMERA_MATRIX,
-                                          DIST_COEFFS, rvec, tvec, 0.1)
+log_count = 0
+# pad_quat_prev = torch.tensor([1,0,0,0])
+# filtered_pad_ang_vel_w = torch.tensor([0,0,])
+# first_apriltag_detected = False
+reached_count = 0
+higher_error_count = 0
+def cv_apriltag(raw_image_, m, d):
+    global log_count, control_action, tag_detected, policy, device, reached_count, P_body_from_tag_w
+    rgb_drone_camera = cv2.cvtColor(cv2.flip(raw_image_, 0), cv2.COLOR_RGB2BGR)
+    gray_image = cv2.cvtColor(rgb_drone_camera, cv2.COLOR_BGR2GRAY)
+    tags = detector.detect(gray_image)
 
-                # get quat
-                quat = data.sensor("body_quat").data
-                p, q, r = data.sensor("body_gyro").data
-                R_body_to_world = quaternion_to_R(quat).T       # ! .T
-                phi, theta, psi = rot_to_rpy_zxy(R_body_to_world)
-                p_cam_in_body = np.array([0.0, 0.0, -0.01])
-                R_cam_to_body = np.eye(3)
-                p_tag_in_boat = np.array([0.0, 0.0, 0.05])
+    if len(tags) > 0:
+        for tag in tags:
+            # print(f"detected tag ID: {tag.tag_id}")
+            img_points = np.array(tag.corners, dtype=np.float32)
+            success, rvec, tvec = solvePnP(
+                object_points,
+                img_points,
+                CAMERA_MATRIX,
+                DIST_COEFFS,
+                flags=cv2.SOLVEPNP_ITERATIVE
+            )
+            if success:
+                tag_detected = True
+                cv2.drawFrameAxes(rgb_drone_camera, CAMERA_MATRIX, DIST_COEFFS, rvec, tvec, 0.1)
 
-                # TODO boat attutite
+                # calculate pos error for controller
+                P_tag_in_cam = torch.from_numpy(tvec.ravel()).float()
+                P_tag_in_body = R_cam_to_body @ P_tag_in_cam + P_cam_in_body
+                # print(f"P_tag_in_body: {P_tag_in_body}")
 
-                p_tag_in_body = R_cam_to_body @ tvec.flatten() + p_cam_in_body
-                # p_drone_in_world = R_body_to_world @ p_tag_in_body + p_tag_in_boat
-                p_drone_in_world = data.body("cf2").xpos.copy()  # TODO test
 
-                # solve MPC
-                # est velocity TODO
-                pos_rel = p_drone_in_world
-                if last_pos_rel is not None:
-                    vel_rel = (pos_rel - last_pos_rel) / dt_control
+                _sensor = torch.from_numpy(d.sensordata).float()
+                quat  = _sensor[6:10]         # [w, x, y, z]
+                R_body_to_world = rotation_matrix(
+                    quat[0].item(), quat[1].item(), quat[2].item(), quat[3].item()
+                ).float()
+                P_tag_from_body_w = R_body_to_world @ P_tag_in_body
+                # print(f"P_tag_from_body_w: {P_tag_from_body_w}")
+
+                P_des_body_from_pad_w = torch.tensor([0.0, 0.0, 0.5], dtype=torch.float32)
+                P_body_from_tag_w = -P_tag_from_body_w
+
+
+                # get pad quat for nn model obs
+                R_tag_to_cam, _ = cv2.Rodrigues(rvec)
+                R_tag_to_cam = torch.from_numpy(R_tag_to_cam).float()   # 转 torch 张量方便后续运算
+                R_tag_to_world = R_body_to_world @ R_cam_to_body @ R_tag_to_cam
+                pitch = torch.asin(torch.clamp(-R_tag_to_world[2, 0], -1.0, 1.0))
+                roll  = torch.atan2(R_tag_to_world[2, 1], R_tag_to_world[2, 2])
+                # pad_quat = rotation_matrix_to_quat_wxyz(R_tag_to_world)
+                # pad_ang_vel_w = quat_to_ang_vel_wxyz(pad_quat_prev, pad_quat, dt_sim)
+                # if first_apriltag_detected is False:
+                #     filtered_pad_ang_vel_w = pad_ang_vel_w
+                # filtered_pad_ang_vel_w = 0.99 * filtered_pad_ang_vel_w + 0.01 * pad_ang_vel_w
+
+                # print(f"pad_quat: {pad_quat} | pad_quat_last: {pad_quat_prev} | pad_ang_vel_w: {filtered_pad_ang_vel_w}")
+                # pad_quat_prev = pad_quat
+                # first_apriltag_detected = True
+
+                # print(f"obs: {obs} | action: {action}")
+
+                xy_error = torch.norm(P_body_from_tag_w[:2])   # P_body_from_tag_w 是 [x, y, z]
+                if xy_error < xy_threshold:
+                    reached_count += 1
+                    obs = torch.cat([P_body_from_tag_w[2].reshape(1), roll.reshape(1), pitch.reshape(1)])  # (1, 3)
+                    # print(f"obs: {obs}")
+                    # control_action = 0.2 * policy(obs)  # action scale 0.2
+                    # 把當前觀測放進緩衝區（最舊的會自動被擠出）
+                    obs_buffer.append(obs)
+                    if reached_count >= 100:   # 0.02 * 100 = 2sec
+                        # 從緩衝區取出 3 筆觀測並拼接成一個長向量
+                        stacked_obs = torch.cat(list(obs_buffer)).unsqueeze(0)  # shape: (1, 9)
+                        # print(f"stack_obs{stacked_obs}")
+
+                        # 用拼接後的觀測呼叫 policy
+                        control_action = 0.2 * policy(obs)  # action scale 0.2
+                        # print(f"control_action: {control_action}")
                 else:
-                    vel_rel = np.zeros(3)
+                    reached_count = 0
+                    control_action = torch.zeros(1,1)
+                    # 重置觀測緩衝區，因為脫離閾值區域，歷史資訊已無意義
+                    obs_buffer.clear()
+                    for _ in range(3):
+                        obs_buffer.append(torch.zeros(3))
 
-                state = np.concatenate([pos_rel, vel_rel])
 
-                target_height = 1.0     # TODO height
-                B = build_B(psi, dt_control, g0)
-                u_cmd = solve_mpc(
-                    state, target_height, Q, R, A, B, dt_control, N=30)
-                if u_cmd is not None and not np.all(u_cmd == 0):
-                    last_u_cmd = u_cmd.copy()
-                else:
-                    u_cmd = last_u_cmd
-                    print("MPC failed")
-                theta_des, phi_des, accel_z_cmd = u_cmd
+            log_count += 1
+            if log_count >= 50:
+                log_count = 0
+                print(f"rvec: {rvec}\n tvec: {tvec}\n")
+                pass
+    else:
+        tag_detected = False
 
-                e_phi = phi_des - phi
-                e_theta = theta_des - theta
-                psi_des = 0
-                e_psi = psi_des - psi
 
-                # WTF TODO error
-                tau_theta = Kp_roll * e_phi + Kd_roll * (0 - p)
-                tau_phi = Kp_pitch * e_theta + Kd_pitch * (0 - q)
-                tau_psi = Kp_yaw * e_psi + Kd_yaw * (0 - r)
 
-                T_total = mq * (g0 + accel_z_cmd)
+    # cv2.imshow("Drone Camera 1920x1080", rgb_drone_camera)    # bug
+    # cv2.waitKey(1)
 
-                # kappa = 1e-9
-                F1 = T_total/4 + tau_theta / \
-                    (2*l) - tau_phi/(2*l) - tau_psi/(4*l)
-                F2 = T_total/4 - tau_theta / \
-                    (2*l) - tau_phi/(2*l) + tau_psi/(4*l)
-                F3 = T_total/4 - tau_theta / \
-                    (2*l) + tau_phi/(2*l) - tau_psi/(4*l)
-                F4 = T_total/4 + tau_theta / \
-                    (2*l) + tau_phi/(2*l) + tau_psi/(4*l)
 
-                des_forces = np.array([F1, F2, F3, F4])
-                data.ctrl[:] = np.clip(des_forces, 0, 0.1573) / 0.1573
 
-                # debug
-                print("tvec: ", tvec)
-                print("p_tag_in_body: ", p_tag_in_body,
-                      "p_drone_in_world", p_drone_in_world)
-                # print("mujoco_cf2_xpos:", data.body("cf2").xpos)
-                # print("mujoco_cf2_quat:", data.body("cf2").xquat)
+if __name__ == '__main__':
+    glfw.init()
+    window = glfw.create_window(1200, 900, "CF2 with Camera", None, None)
+    glfw.make_context_current(window)
+    glfw.swap_interval(1)
 
-                print("throttles: ", data.ctrl[:])
-                print("mujoco actuator force", data.actuator_force)
-                print(f"u_cmd: roll={u_cmd[0]:.3f}, pitch={
-                      u_cmd[1]:.3f}, accel_z={u_cmd[2]:.3f}")
-                print(f"state: pos={state[:3]}, vel={state[3:]}")
+    # 加载模型
+    model, data, wave_pad = load_model()
 
-                last_pos_rel = pos_rel
+    # 创建可视化数据结构
+    cam = mujoco.MjvCamera()          # 主视角相机
+    opt = mujoco.MjvOption()
+    mujoco.mjv_defaultOption(opt)
+    scene = mujoco.MjvScene(model, maxgeom=10000)
+    context = mujoco.MjrContext(model, mujoco.mjtFontScale.mjFONTSCALE_150.value)
 
-            # show track camera
-            bgr = cv2.resize(bgr, (640, 480))
-            cv2.imshow('MuJoCo Camera Output', bgr)
-        # else:
-            #     # lost tag
-            #     # data.ctrl[:] = mq * g0 / 4
-            # print("no tag")
-            #     data.ctrl[:] = 1
+    opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = True
+    opt.frame = mujoco.mjtFrame.mjFRAME_BODY
+    # opt.flags[mujoco.mjtVisFlag.mjVIS_CAMERA] = True
 
-        if cv2.waitKey(1) == 27:
-            break
+    # 设置默认相机参数( tracking drone )
+    cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+    cam.trackbodyid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cf2")
+    cam.lookat = np.array([0, 0, 0])          # 相对于 body 的注视点（0 就是 body 中心）
+    cam.distance = 2.0                        # 相机距离注视点的距离
+    cam.azimuth = 90                          # 在水平面内的角度（度）
+    cam.elevation = -30                       # 俯仰角
 
-cv2.destroyAllWindows()
-glfw.terminate()
-del context
-del scene
+    # drone camera setting
+    camera_name = 'drone_camera'
+    camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
+    drone_camera = mujoco.MjvCamera()
+    drone_camera.type = mujoco.mjtCamera.mjCAMERA_FIXED
+    drone_camera.fixedcamid = camera_id
+    small_width, small_height = 640, 480  # 可根据需要调整
+    full_width, full_height = 1920, 1080
+    full_viewport = mujoco.MjrRect(0, 0, full_width, full_height)
+    full_rgb = np.zeros((full_height, full_width, 3), dtype=np.uint8)
+    full_depth = np.zeros((full_height, full_width), dtype=np.float32)
+
+    cf2_body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, 'cf2')
+    wave_pad_body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, 'wave_pad')
+
+    # main loop
+    while not glfw.window_should_close(window):
+        # get main viewport
+        viewport_width, viewport_height = glfw.get_framebuffer_size(window)
+        main_viewport = mujoco.MjrRect(0, 0, viewport_width, viewport_height)
+
+        # high resoluation drone camera for cv2
+        mujoco.mjr_render(full_viewport, scene, context)
+        mujoco.mjr_readPixels(full_rgb, full_depth, full_viewport, context)
+
+        global ctrl_pos_error, tag_detected
+        cv_apriltag(full_rgb, model, data)
+
+        # update and render main_viewport
+        mujoco.mjv_updateScene(model, data, opt, None, cam,
+                               mujoco.mjtCatBit.mjCAT_ALL.value, scene)
+        mujoco.mjr_render(main_viewport, scene, context)
+
+        # update and render mujoco drone_camera_viewport ( right top of main_viewport)
+        loc_x = viewport_width - small_width
+        loc_y = viewport_height - small_height
+        drone_camera_viewport = mujoco.MjrRect(loc_x, loc_y, small_width, small_height)
+        mujoco.mjv_updateScene(model, data, opt, None, drone_camera,
+                               mujoco.mjtCatBit.mjCAT_ALL.value, scene)
+        mujoco.mjr_render(drone_camera_viewport, scene, context)
+
+        # 交换缓冲区、处理事件
+        glfw.swap_buffers(window)
+        glfw.poll_events()
+
+        # update sim
+        for _ in range(decimation):
+            wave_pad.step(data)
+            mujoco.mj_step(model, data)
+
+        # 控制周期
+        if check_contact(data, cf2_body, wave_pad_body):
+            # 所有电机 ctrl 置零
+            data.actuator('motor1').ctrl[0] = 0
+            data.actuator('motor2').ctrl[0] = 0
+            data.actuator('motor3').ctrl[0] = 0
+            data.actuator('motor4').ctrl[0] = 0
+        else:
+            control_callback(model, data, dt_control, P_body_from_tag_w, control_action)
+
+    cv2.destroyAllWindows()
+    glfw.terminate()
