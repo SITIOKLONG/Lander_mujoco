@@ -5,6 +5,7 @@ from cv2 import solvePnP
 import numpy as np
 from pupil_apriltags import Detector
 import torch
+import collections
 
 import os
 os.environ["MUJOCO_GL"] = "glfw"
@@ -20,9 +21,12 @@ decimation = 2
 dt_control = dt_sim * decimation
 
 
-policy = torch.jit.load("./policy/policy_3.pt")
+policy = torch.jit.load("./policy/policy_7.pt")
 policy.eval()
 device = torch.device("mps")
+obs_buffer = collections.deque(maxlen=3)
+for _ in range(3):
+    obs_buffer.append(torch.zeros(3))
 
 # 设定阈值 (米)
 xy_threshold = 0.3
@@ -147,14 +151,26 @@ def cv_apriltag(raw_image_, m, d):
                 xy_error = torch.norm(P_body_from_tag_w[:2])   # P_body_from_tag_w 是 [x, y, z]
                 if xy_error < xy_threshold:
                     reached_count += 1
+                    obs = torch.cat([P_body_from_tag_w[2].reshape(1), roll.reshape(1), pitch.reshape(1)])  # (1, 3)
+                    # print(f"obs: {obs}")
+                    # control_action = 0.2 * policy(obs)  # action scale 0.2
+                    # 把當前觀測放進緩衝區（最舊的會自動被擠出）
+                    obs_buffer.append(obs)
                     if reached_count >= 100:   # 0.02 * 100 = 2sec
-                        obs = torch.cat([P_body_from_tag_w[2].reshape(1), roll.reshape(1), pitch.reshape(1)]).unsqueeze(0)  # (1, 5)
-                        # print(f"obs: {obs}")
+                        # 從緩衝區取出 3 筆觀測並拼接成一個長向量
+                        stacked_obs = torch.cat(list(obs_buffer)).unsqueeze(0)  # shape: (1, 9)
+                        # print(f"stack_obs{stacked_obs}")
+
+                        # 用拼接後的觀測呼叫 policy
                         control_action = 0.2 * policy(obs)  # action scale 0.2
                         # print(f"control_action: {control_action}")
                 else:
                     reached_count = 0
                     control_action = torch.zeros(1,1)
+                    # 重置觀測緩衝區，因為脫離閾值區域，歷史資訊已無意義
+                    obs_buffer.clear()
+                    for _ in range(3):
+                        obs_buffer.append(torch.zeros(3))
 
 
             log_count += 1
